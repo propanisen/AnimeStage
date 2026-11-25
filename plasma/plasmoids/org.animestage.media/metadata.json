@@ -1,0 +1,22 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "propanisen"
+            }
+        ],
+        "Category": "Multimedia",
+        "Description": "Now playing – play/pause, title, progress",
+        "EnabledByDefault": true,
+        "Icon": "media-default-album",
+        "Id": "org.animestage.media",
+        "License": "GPL-3.0",
+        "Name": "AnimeStage Music",
+        "Version": "2.0.0",
+        "Website": "https://github.com/propanisen/AnimeStage",
+        "Name[de]": "AnimeStage Musik",
+        "Description[de]": "Was gerade läuft – Play/Pause, Titel, Fortschritt"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0"
+}

@@ -1,0 +1,22 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "propanisen"
+            }
+        ],
+        "Category": "System Information",
+        "Description": "CPU, RAM and GPU as rings in the panel",
+        "EnabledByDefault": true,
+        "Icon": "utilities-system-monitor",
+        "Id": "org.animestage.system",
+        "License": "GPL-3.0",
+        "Name": "AnimeStage System Load",
+        "Version": "2.0.0",
+        "Website": "https://github.com/propanisen/AnimeStage",
+        "Name[de]": "AnimeStage Auslastung",
+        "Description[de]": "CPU, RAM und GPU als Ringe im Panel"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0"
+}

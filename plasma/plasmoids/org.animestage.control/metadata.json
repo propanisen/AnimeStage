@@ -1,0 +1,22 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "propanisen"
+            }
+        ],
+        "Category": "System Information",
+        "Description": "All settings of the AnimeStage theme",
+        "EnabledByDefault": true,
+        "Icon": "preferences-desktop-theme",
+        "Id": "org.animestage.control",
+        "License": "GPL-3.0",
+        "Name": "AnimeStage Control Center",
+        "Version": "1.0.0",
+        "Website": "https://github.com/propanisen/AnimeStage",
+        "Name[de]": "AnimeStage Kontrollzentrum",
+        "Description[de]": "Alle Einstellungen des AnimeStage-Themes"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0"
+}

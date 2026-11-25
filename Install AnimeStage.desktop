@@ -1,0 +1,20 @@
+[Desktop Entry]
+Type=Application
+Name=Install AnimeStage
+Name[de]=AnimeStage installieren
+Name[ja]=AnimeStage をインストール
+Name[fr]=Installer AnimeStage
+Name[es]=Instalar AnimeStage
+Name[pt_BR]=Instalar o AnimeStage
+Name[it]=Installa AnimeStage
+Name[pl]=Zainstaluj AnimeStage
+Name[nl]=AnimeStage installeren
+Name[ru]=Установить AnimeStage
+Name[zh_CN]=安装 AnimeStage
+Name[zh_TW]=安裝 AnimeStage
+Name[ko]=AnimeStage 설치
+Comment=Anime desktop theme for KDE Plasma 6 – graphical installer
+Comment[de]=Anime-Desktop-Theme für KDE Plasma 6 – grafischer Installer
+Icon=system-software-install
+Exec=sh -c 'cd "$(dirname "$0")" && exec bash ./install.sh --gui' %k
+Terminal=false

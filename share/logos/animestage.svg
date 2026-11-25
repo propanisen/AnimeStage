@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <!-- AnimeStage – original logo: sparkle star in stage light -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1B2230"/>
+      <stop offset="1" stop-color="#0C1015"/>
+    </linearGradient>
+    <linearGradient id="star" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5FD3E6"/>
+      <stop offset="1" stop-color="#E0568E"/>
+    </linearGradient>
+  </defs>
+  <rect x="6" y="6" width="116" height="116" rx="28" fill="url(#bg)"/>
+  <path d="M64 18 C68 48 80 60 110 64 C80 68 68 80 64 110 C60 80 48 68 18 64 C48 60 60 48 64 18 Z" fill="url(#star)"/>
+  <path d="M96 22 C97 30 100 33 108 34 C100 35 97 38 96 46 C95 38 92 35 84 34 C92 33 95 30 96 22 Z" fill="#F4F4F6" opacity="0.9"/>
+  <circle cx="64" cy="64" r="7" fill="#0C1015" opacity="0.35"/>
+</svg>

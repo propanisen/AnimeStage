@@ -1,0 +1,24 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "propanisen"
+            }
+        ],
+        "Category": "Application Launchers",
+        "Description": "Start menu with character, search, favorites and categories",
+        "EnabledByDefault": true,
+        "Icon": "start-here-kde",
+        "Id": "org.animestage.launcher",
+        "License": "GPL-3.0",
+        "Name": "AnimeStage Launcher",
+        "Version": "1.0.0",
+        "Website": "https://github.com/propanisen/AnimeStage",
+        "Description[de]": "Startmenü mit Figur, Suche, Favoriten und Kategorien"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0",
+    "X-Plasma-Provides": [
+        "org.kde.plasma.launchermenu"
+    ]
+}

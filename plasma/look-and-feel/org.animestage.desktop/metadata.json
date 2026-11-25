@@ -1,0 +1,19 @@
+{
+    "KPackageStructure": "Plasma/LookAndFeel",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "propanisen"
+            }
+        ],
+        "Category": "",
+        "Description": "Anime dark theme for KDE Plasma 6 – pick any anime, everything adjustable in the AnimeStage Control Center",
+        "Id": "org.animestage.desktop",
+        "License": "GPL-3.0",
+        "Name": "AnimeStage",
+        "Version": "1.0",
+        "Website": "https://github.com/propanisen/AnimeStage",
+        "Description[de]": "Anime-Dark-Theme für KDE Plasma 6 – beliebiger Anime, alles im AnimeStage-Kontrollzentrum einstellbar"
+    },
+    "X-Plasma-APIVersion": "2"
+}

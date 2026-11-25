@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=AnimeStage Control Center
+Name[de]=AnimeStage Kontrollzentrum
+GenericName=Anime theme settings
+GenericName[de]=Anime-Theme einstellen
+Comment=Choose an anime, adjust colors, wallpapers, terminal and widgets
+Comment[de]=Anime wählen, Farben, Hintergründe, Terminal und Widgets anpassen
+Exec=plasmawindowed org.animestage.control
+Icon=animestage
+Categories=Settings;DesktopSettings;Qt;KDE;
+Keywords=anime;theme;wallpaper;konachan;anilist;

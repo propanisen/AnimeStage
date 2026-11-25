@@ -1,0 +1,16 @@
+[kdeglobals][General]
+ColorScheme=AnimeStage
+
+[kdeglobals][KDE]
+widgetStyle=Breeze
+
+[plasmarc][Theme]
+name=AnimeStage
+
+[kwinrc][org.kde.kdecoration2]
+library=org.kde.breeze
+theme=Breeze
+
+[ksplashrc][KSplash]
+Engine=KSplashQML
+Theme=org.animestage.desktop

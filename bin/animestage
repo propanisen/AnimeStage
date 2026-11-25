@@ -1,0 +1,4290 @@
+#!/usr/bin/env python3
+# AnimeStage – control program for the anime KDE theme.
+#
+# One central config (~/.config/animestage/config.json) describes character,
+# colors, style and images. All widgets read it live; this program
+# generates the color scheme, Plasma style, window decoration, Konsole colors,
+# splash and lock screen from it and downloads the images.
+
+import argparse
+import copy
+import datetime
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+# All image sources (search + download) live in lib/animestage_sources.py –
+# development folder first, otherwise the installed copy.
+sys.path[:0] = [os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib"),
+                os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), "animestage", "lib")]
+import animestage_sources as sources  # noqa: E402
+from animestage_i18n import _, setup as i18n_setup  # noqa: E402
+
+HOME = os.path.expanduser("~")
+XDG_CONFIG = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
+XDG_DATA = os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share")
+XDG_STATE = os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local", "state")
+XDG_CACHE = os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache")
+
+CONFIG_DIR = os.path.join(XDG_CONFIG, "animestage")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+DATA_DIR = os.path.join(XDG_DATA, "animestage")
+IMAGE_DIR = os.path.join(DATA_DIR, "images")
+THUMB_DIR = os.path.join(XDG_CACHE, "animestage", "thumbs")
+CREDITS_FILE = os.path.join(IMAGE_DIR, "credits.json")
+STATE_DIR = os.path.join(XDG_STATE, "animestage")
+BACKUP_DIR = os.path.join(STATE_DIR, "backups")
+LOG_FILE = os.path.join(STATE_DIR, "animestage.log")
+
+THEME_NAME = "AnimeStage"
+LNF_ID = "org.animestage.desktop"
+UA = {"User-Agent": "AnimeStage/1.0 (personal KDE desktop theme)"}
+# Danbooru bans AI images; these tags filter additionally in case something
+# slips through, and keep the images suitable for everyday use.
+BAD_TAGS = {
+    "ai-generated", "ai-assisted"
+}
+IMAGE_SLOTS = ["launcher", "splash", "wallpaper", "lock"]
+PAPIRUS_TAG = "20260801"
+PAPIRUS_URL = f"https://github.com/PapirusDevelopmentTeam/papirus-icon-theme/archive/refs/tags/{PAPIRUS_TAG}.tar.gz"
+PAPIRUS_BLUE = ("#5294e2", "#4877b1")
+FONT_FILES = ["Regular", "Medium", "Bold", "ExtraBold"]
+FONT_URL = "https://raw.githubusercontent.com/google/fonts/main/ofl/mplusrounded1c/MPLUSRounded1c-{}.ttf"
+
+# Files backed up before layout/theme changes.
+BACKUP_FILES = [
+    "plasma-org.kde.plasma.desktop-appletsrc", "plasmashellrc", "kdeglobals",
+    "kwinrc", "ksplashrc", "kscreenlockerrc", "konsolerc", "plasmarc",
+    "breezerc", "Kvantum/kvantum.kvconfig",
+]
+
+
+def find_share():
+    here = os.path.dirname(os.path.realpath(__file__))
+    for cand in (os.path.join(here, "..", "share"), DATA_DIR):
+        if os.path.isdir(os.path.join(cand, "logos")):
+            return os.path.realpath(cand)
+    sys.exit(_('animestage: Daten nicht gefunden – ist das Theme installiert?'))
+
+
+SHARE = find_share()
+
+
+def log(msg):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(LOG_FILE, "a", encoding="utf-8") as fh:
+        fh.write(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S} {msg}\n")
+
+
+def say(msg):
+    print(msg, flush=True)
+    log(msg)
+
+
+def run(cmd, check=False, quiet=True):
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        log(f"fehlt: {cmd[0]}")
+        return None
+    if res.returncode != 0:
+        log(f"{' '.join(cmd)} -> {res.returncode}: {res.stderr.strip()[:300]}")
+        if check:
+            raise SystemExit(res.stderr)
+    elif not quiet:
+        print(res.stdout, end="")
+    return res
+
+
+def qdbus():
+    """Name of the qdbus program – Fedora/Bazzite only ship qdbus-qt6."""
+    for name in ("qdbus6", "qdbus-qt6", "qdbus"):
+        if shutil.which(name):
+            return name
+    return "qdbus"
+
+
+def have(cmd):
+    return shutil.which(cmd) is not None
+
+
+def write_atomic(path, text, binary=False):
+    path = os.path.abspath(path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.tmp{os.getpid()}"
+    with open(tmp, "wb" if binary else "w", **({} if binary else {"encoding": "utf-8"})) as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+
+
+FIXED_COLORS = {"positive": "#5BE0A0", "neutral": "#F5C35B", "negative": "#FF5C7A"}
+DEFAULT_COLORS = {"accent": "#4FC3D9", "accent2": "#E0568E", "bg": "#0C1115", "surface": "#121A20",
+                  "surfaceAlt": "#1B252D", "text": "#ECF3F6", "muted": "#93A4AD", **FIXED_COLORS}
+
+
+# --------------------------------------------------------------------------
+# Config
+# --------------------------------------------------------------------------
+
+def default_config():
+    return {
+        "version": 2,
+        "rev": 0,
+        "anime": {},
+        "colors": dict(DEFAULT_COLORS),
+        "theme": {"autoColors": True},
+        "style": {
+            "radius": 14,
+            "panelOpacity": 0.90,
+            "popupOpacity": 0.92,
+            "widgetOpacity": 0.72,
+            "borderOpacity": 0.35,
+            "windowDeco": "breeze",
+            "appStyle": "breeze",
+            "uiFont": False,
+            "font": "M PLUS Rounded 1c",
+            "icons": "papirus",
+            "animations": True,
+        },
+        "images": {slot: "" for slot in IMAGE_SLOTS},
+        "folders": [],
+        "launcher": {"icon": "distro", "columns": 6, "showHero": True, "greeting": True},
+        "clock": {"use24h": True, "seconds": False, "japanese": True},
+        "system": {"gpu": True, "temps": True},
+        "terminal": {"enabled": False, "opacity": 0.97, "fontSize": 11, "imageRows": 16, "bgImage": True, "bgDim": 0.86,
+                     "bgSource": "anime", "bgTags": "", "bgEveryStart": True},
+        "apps": {"firefox": True, "vscode": True},
+        "firefox": {"source": "anime", "tags": "", "everyStart": True, "dim": 0.35, "ownColors": True},
+        "sources": dict(sources.DEFAULTS),
+        "characters": {"gender": "female"},
+        "taskbar": {"labels": True, "group": False, "width": "narrow"},
+        "language": "auto",
+        "updates": {"check": True, "auto": False},
+        "wallswitch": wall_defaults(),
+    }
+
+
+def deep_merge(base, over):
+    out = copy.deepcopy(base)
+    for k, v in (over or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def load_config():
+    cfg = default_config()
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, encoding="utf-8") as fh:
+                cfg = deep_merge(cfg, json.load(fh))
+        except (OSError, ValueError) as exc:
+            log(f"config defekt, nutze Standard: {exc}")
+    a = cfg.get("anime")
+    if a and "wallTag" not in a:            # older config: tags were named after the website
+        a["wallTag"], a["cutTag"] = a.pop("konachan", ""), a.pop("danbooru", "")
+        a["tagSites"] = {"wallpaper": "konachan", "cutouts": "danbooru"}
+    return cfg
+
+
+def wall_src(cfg):
+    """Image source for wallpapers, terminal and Firefox (configurable)."""
+    return sources.for_purpose((cfg.get("sources") or {}).get("wallpaper"), "wallpaper")
+
+
+def cut_src(cfg):
+    """Image source for cutouts."""
+    return sources.for_purpose((cfg.get("sources") or {}).get("cutouts"), "cutouts")
+
+
+def post_key(post):
+    """Unique image ID across all sources (Konachan: just the number, as before)."""
+    return post["id"] if post["site"] == "konachan" else f"{sources.get(post['site']).prefix}-{post['id']}"
+
+
+def save_config(cfg):
+    cfg["rev"] = int(cfg.get("rev", 0)) + 1
+    write_atomic(CONFIG_FILE, json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
+
+
+def get_path(obj, path):
+    for key in [p for p in path.split(".") if p]:
+        if not isinstance(obj, dict) or key not in obj:
+            return None
+        obj = obj[key]
+    return obj
+
+
+def set_path(obj, path, value):
+    keys = [p for p in path.split(".") if p]
+    for key in keys[:-1]:
+        obj = obj.setdefault(key, {})
+    obj[keys[-1]] = value
+
+
+def parse_value(raw):
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return raw
+
+
+# --------------------------------------------------------------------------
+# Colors
+# --------------------------------------------------------------------------
+
+HEX_RE = re.compile(r"^#?([0-9a-fA-F]{6})$")
+
+
+def hex2rgb(h):
+    m = HEX_RE.match(str(h).strip())
+    if not m:
+        raise ValueError(_('keine Farbe: {h}', h=h))
+    v = m.group(1)
+    return tuple(int(v[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def rgb2hex(c):
+    return "#" + "".join(f"{max(0, min(255, round(x))):02X}" for x in c)
+
+
+def mix(a, b, t):
+    ca, cb = hex2rgb(a), hex2rgb(b)
+    return rgb2hex(tuple(ca[i] + (cb[i] - ca[i]) * t for i in range(3)))
+
+
+def lighten(c, t):
+    return mix(c, "#FFFFFF", t)
+
+
+def darken(c, t):
+    return mix(c, "#000000", t)
+
+
+def luminance(c):
+    def ch(v):
+        v /= 255
+        return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+    r, g, b = hex2rgb(c)
+    return 0.2126 * ch(r) + 0.7152 * ch(g) + 0.0722 * ch(b)
+
+
+def on_color(c, dark, light="#FFFFFF"):
+    # Text on accent surfaces: light accents need dark text, dark accents light text.
+    return dark if luminance(c) > 0.30 else light
+
+
+def csv(c):
+    return ",".join(str(x) for x in hex2rgb(c))
+
+
+def palette(cfg):
+    c = dict(cfg["colors"])
+    for k, v in FIXED_COLORS.items():
+        c.setdefault(k, v)
+    for k, v in c.items():
+        c[k] = rgb2hex(hex2rgb(v))
+    c["onAccent"] = on_color(c["accent"], darken(c["bg"], 0.2))
+    c["onAccent2"] = on_color(c["accent2"], darken(c["bg"], 0.2))
+    return c
+
+
+def colorscheme_text(cfg):
+    p = palette(cfg)
+    bg, sf, sa, tx, mu, ac, a2 = (p[k] for k in ("bg", "surface", "surfaceAlt", "text", "muted", "accent", "accent2"))
+    common = {
+        "DecorationFocus": ac,
+        "DecorationHover": lighten(ac, 0.15),
+        "ForegroundActive": a2,
+        "ForegroundInactive": mu,
+        "ForegroundLink": ac,
+        "ForegroundNegative": p["negative"],
+        "ForegroundNeutral": p["neutral"],
+        "ForegroundNormal": tx,
+        "ForegroundPositive": p["positive"],
+        "ForegroundVisited": a2,
+    }
+    groups = {
+        "Colors:Window": {"BackgroundNormal": sf, "BackgroundAlternate": sa},
+        "Colors:View": {"BackgroundNormal": bg, "BackgroundAlternate": mix(bg, sf, 0.6)},
+        "Colors:Button": {"BackgroundNormal": sa, "BackgroundAlternate": mix(sa, ac, 0.15)},
+        "Colors:Header": {"BackgroundNormal": mix(bg, sf, 0.5), "BackgroundAlternate": sf},
+        "Colors:Header][Inactive": {"BackgroundNormal": bg, "BackgroundAlternate": sf},
+        "Colors:Tooltip": {"BackgroundNormal": sf, "BackgroundAlternate": sa},
+        "Colors:Complementary": {"BackgroundNormal": bg, "BackgroundAlternate": sf},
+        "Colors:Selection": {
+            "BackgroundNormal": ac,
+            "BackgroundAlternate": mix(ac, bg, 0.45),
+            "ForegroundNormal": p["onAccent"],
+            "ForegroundActive": p["onAccent"],
+            "ForegroundInactive": mix(p["onAccent"], ac, 0.35),
+            "ForegroundLink": p["onAccent"],
+            "ForegroundVisited": p["onAccent"],
+        },
+    }
+    lines = []
+    for name in ("ColorEffects:Disabled", "ColorEffects:Inactive"):
+        lines.append(f"[{name}]")
+        if name.endswith("Disabled"):
+            lines += ["Color=56,56,56", "ColorAmount=0", "ColorEffect=0", "ContrastAmount=0.65",
+                      "ContrastEffect=1", "IntensityAmount=0.1", "IntensityEffect=2"]
+        else:
+            lines += ["ChangeSelectionColor=true", "Color=112,111,110", "ColorAmount=0.025",
+                      "ColorEffect=2", "ContrastAmount=0.1", "ContrastEffect=2", "Enable=false",
+                      "IntensityAmount=0", "IntensityEffect=0"]
+        lines.append("")
+    for name, vals in groups.items():
+        merged = dict(common)
+        merged.update(vals)
+        lines.append(f"[{name}]")
+        lines += [f"{k}={csv(v)}" for k, v in sorted(merged.items())]
+        lines.append("")
+    lines += [
+        "[General]", f"ColorScheme={THEME_NAME}", f"Name={THEME_NAME}", "shadeSortColumn=true", "",
+        "[KDE]", "contrast=4", "",
+        "[WM]",
+        f"activeBackground={csv(mix(bg, sf, 0.5))}",
+        f"activeBlend={csv(ac)}",
+        f"activeForeground={csv(tx)}",
+        f"inactiveBackground={csv(bg)}",
+        f"inactiveBlend={csv(mu)}",
+        f"inactiveForeground={csv(mu)}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+CONTROL_ICON = os.path.join(XDG_DATA, "icons", "hicolor", "scalable", "apps", "animestage-control.svg")
+
+
+def write_control_icon(cfg):
+    """Control Center icon: three sliders in the current theme colors."""
+    p = palette(cfg)
+    bg, track = lighten(p["bg"], 0.10), mix(p["muted"], p["bg"], 0.45)
+    knobs = [(78, p["accent"]), (44, p["accent2"]), (64, p["text"])]
+    rows = []
+    for i, (x, col) in enumerate(knobs):
+        y = 36 + i * 28
+        rows.append(f'<rect x="24" y="{y - 3}" width="80" height="6" rx="3" fill="{track}"/>'
+                    f'<rect x="24" y="{y - 3}" width="{x - 24}" height="6" rx="3" fill="{col}" opacity="0.55"/>'
+                    f'<circle cx="{x}" cy="{y}" r="10" fill="{col}"/><circle cx="{x}" cy="{y}" r="4" fill="{bg}"/>')
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">'
+           f'<rect x="6" y="6" width="116" height="116" rx="28" fill="{bg}"/>'
+           f'<rect x="6.5" y="6.5" width="115" height="115" rx="27.5" fill="none" stroke="{p["accent"]}" stroke-opacity="0.45"/>'
+           + "".join(rows) + "</svg>\n")
+    write_atomic(CONTROL_ICON, svg)
+
+
+RULE_ID = "animestage-control"
+
+
+def apply_window_rule(cfg=None):
+    """KWin window rule: the Control Center runs via plasmawindowed – without a rule
+    the taskbar assigns it to that helper (wrong icon, second entry). The rule
+    links the window to org.animestage.control (own icon, pinned button)."""
+    base = ["--file", "kwinrulesrc"]
+    rules = kwin_rule_order()
+    if RULE_ID not in rules:
+        rules.append(RULE_ID)
+    values = {
+        "Description": "AnimeStage Control Center: taskbar icon",
+        "wmclass": "org.kde.plasmawindowed", "wmclassmatch": "1", "wmclasscomplete": "false",
+        "titlematch": "0",
+        "desktopfile": "org.animestage.control", "desktopfilerule": "2",
+    }
+    for key, val in values.items():
+        run(["kwriteconfig6", *base, "--group", RULE_ID, "--key", key, val])
+    write_kwin_rule_order(rules)
+    run([qdbus(), "org.kde.KWin", "/KWin", "reconfigure"])
+
+
+def kwin_rule_order():
+    """Rule IDs from kwinrulesrc – Plasma 6 uses "Order", older versions "rules"."""
+    out = []
+    for key in ("Order", "rules"):
+        res = run(["kreadconfig6", "--file", "kwinrulesrc", "--group", "General", "--key", key])
+        for r in (res.stdout.strip().split(",") if res and res.stdout.strip() else []):
+            if r and r not in out:
+                out.append(r)
+    return out
+
+
+def write_kwin_rule_order(rules):
+    base = ["kwriteconfig6", "--file", "kwinrulesrc", "--group", "General"]
+    run([*base, "--key", "Order", ",".join(rules)])
+    run([*base, "--key", "rules", "--delete"])
+    run([*base, "--key", "count", "--delete"])
+
+
+def remove_window_rule():
+    base = ["--file", "kwinrulesrc"]
+    write_kwin_rule_order([r for r in kwin_rule_order() if r != RULE_ID])
+    run(["kwriteconfig6", *base, "--group", RULE_ID, "--key", "desktopfilerule", "--delete"])
+    run([qdbus(), "org.kde.KWin", "/KWin", "reconfigure"])
+
+
+def apply_colors(cfg):
+    write_control_icon(cfg)
+    path = os.path.join(XDG_DATA, "color-schemes", f"{THEME_NAME}.colors")
+    write_atomic(path, colorscheme_text(cfg))
+    # plasma-apply-colorscheme ignores a scheme that is already active; the
+    # placeholder name forces changed colors to be redistributed.
+    run(["kwriteconfig6", "--file", "kdeglobals", "--group", "General", "--key", "ColorScheme", "AnimeStageReload"])
+    run(["plasma-apply-colorscheme", THEME_NAME])
+    say(_('Farbschema angewendet'))
+
+
+# --------------------------------------------------------------------------
+# Plasma style (desktoptheme) – 9-slice frames from a generator
+# --------------------------------------------------------------------------
+
+def _corner_paths(kind, x, y, s):
+    """Fill and accent edge of a corner. The edge is a filled quarter
+    ring (not a stroke), so nothing sticks out of the s×s cell."""
+    import math
+    cx, cy, start = {
+        "topleft": (x + s, y + s, 180), "topright": (x, y + s, 270),
+        "bottomright": (x, y, 0), "bottomleft": (x + s, y, 90),
+    }[kind]
+
+    def pt(r, deg):
+        t = math.radians(deg)
+        return f"{cx + r * math.cos(t):.3f},{cy + r * math.sin(t):.3f}"
+
+    o0, o1 = pt(s, start), pt(s, start + 90)
+    i0, i1 = pt(s - 1, start), pt(s - 1, start + 90)
+    fill = f"M{o0} A{s},{s} 0 0 1 {o1} L{cx},{cy} Z"
+    ring = f"M{o0} A{s},{s} 0 0 1 {o1} L{i1} A{s-1},{s-1} 0 0 0 {i0} Z"
+    return fill, ring
+
+
+def frame_svg(r, opacity, border_opacity, margins, prefixes=("",), shadow=12, mask=True, corner_border=True):
+    """Creates a Plasma FrameSvg with rounded corners, accent edge and shadow."""
+    s = max(2, int(r))
+    E = 8
+    parts = []
+    gid = [0]
+
+    def nid():
+        gid[0] += 1
+        return f"n{gid[0]}"
+
+    fill_style = f"fill:currentColor;fill-opacity:{opacity:.3f}"
+    edge_style = f"fill:currentColor;fill-opacity:{border_opacity:.3f}"
+
+    def frame(prefix, ox, oy, mask_mode=False):
+        p = f"{prefix}-" if prefix else ""
+        fs = "fill:#000000" if mask_mode else fill_style
+        cls_fill = "" if mask_mode else ' class="ColorScheme-Background"'
+        cls_line = ' class="ColorScheme-Highlight"'
+        pos = {
+            "topleft": (ox, oy), "top": (ox + s, oy), "topright": (ox + s + E, oy),
+            "left": (ox, oy + s), "center": (ox + s, oy + s), "right": (ox + s + E, oy + s),
+            "bottomleft": (ox, oy + s + E), "bottom": (ox + s, oy + s + E),
+            "bottomright": (ox + s + E, oy + s + E),
+        }
+        for name, (x, y) in pos.items():
+            w = E if name in ("top", "center", "bottom") else s
+            h = E if name in ("left", "center", "right") else s
+            body = [f'<rect x="{x}" y="{y}" width="{w}" height="{h}" style="fill:#000000;fill-opacity:0"/>']
+            if name in ("topleft", "topright", "bottomleft", "bottomright"):
+                fp, lp = _corner_paths(name, x, y, s)
+                body.append(f'<path{cls_fill} d="{fp}" style="{fs}"/>')
+                # Plasma stretches corners at panel ends horizontally – an edge in there
+                # would turn into a colored haze. Panels leave it out.
+                if not mask_mode and border_opacity > 0 and corner_border:
+                    body.append(f'<path{cls_line} d="{lp}" style="{edge_style}"/>')
+            else:
+                body.append(f'<rect{cls_fill} x="{x}" y="{y}" width="{w}" height="{h}" style="{fs}"/>')
+                if not mask_mode and border_opacity > 0 and name != "center" and (corner_border or name == "top"):
+                    # As a filled rectangle, not a stroke: a stroke's outline sticks out
+                    # half a pixel beyond the element, and Plasma stretches that empty
+                    # margin too – at the panel ends that became wide holes.
+                    ex, ey, ew, eh = {
+                        "top": (x, y, w, 1), "bottom": (x, y + h - 1, w, 1),
+                        "left": (x, y, 1, h), "right": (x + w - 1, y, 1, h),
+                    }[name]
+                    body.append(f'<rect{cls_line} x="{ex}" y="{ey}" width="{ew}" height="{eh}" style="{edge_style}"/>')
+            parts.append(f'<g id="{p}{name}">' + "".join(body) + "</g>")
+        if not mask_mode:
+            # Without this hint Plasma tiles the borders in 8 px pieces –
+            # which left thin lines at every seam.
+            parts.append(f'<rect id="{p}hint-stretch-borders" x="{ox+12}" y="{oy+2*s+E+4}" width="1" height="1" style="fill:none"/>')
+            t, b, l, rr = margins
+            hy = oy + 2 * s + E + 4
+            parts.append(f'<rect id="{p}hint-top-margin" x="{ox}" y="{hy}" width="1" height="{t}" style="fill:none"/>')
+            parts.append(f'<rect id="{p}hint-bottom-margin" x="{ox+3}" y="{hy}" width="1" height="{b}" style="fill:none"/>')
+            parts.append(f'<rect id="{p}hint-left-margin" x="{ox+6}" y="{hy}" width="{l}" height="1" style="fill:none"/>')
+            parts.append(f'<rect id="{p}hint-right-margin" x="{ox+6}" y="{hy+3}" width="{rr}" height="1" style="fill:none"/>')
+
+    ox = 0
+    for prefix in prefixes:
+        frame(prefix, ox, 0)
+        if mask:
+            frame(f"mask-{prefix}" if prefix else "mask", ox, 60, mask_mode=True)
+        ox += 2 * s + E + 20
+
+    defs = []
+    if shadow:
+        S = shadow
+        y0 = 140
+        stops = '<stop offset="0" stop-color="#000" stop-opacity="0.42"/><stop offset="0.45" stop-color="#000" stop-opacity="0.16"/><stop offset="1" stop-color="#000" stop-opacity="0"/>'
+        corners = {"topleft": (S, S), "topright": (0, S), "bottomright": (0, 0), "bottomleft": (S, 0)}
+        x = 0
+        for name, (cx, cy) in corners.items():
+            gid_ = nid()
+            defs.append(f'<radialGradient id="{gid_}" gradientUnits="userSpaceOnUse" cx="{x+cx}" cy="{y0+cy}" r="{S}">{stops}</radialGradient>')
+            parts.append(f'<rect id="shadow-{name}" x="{x}" y="{y0}" width="{S}" height="{S}" style="fill:url(#{gid_})"/>')
+            x += S + 4
+        edges = {"top": (0, 1, 0, 0, 1, S), "bottom": (0, 0, 0, 1, 1, S),
+                 "left": (1, 0, 0, 0, S, 1), "right": (0, 0, 1, 0, S, 1)}
+        for name, (x1, y1, x2, y2, w, h) in edges.items():
+            gid_ = nid()
+            defs.append(f'<linearGradient id="{gid_}" x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}">{stops}</linearGradient>')
+            parts.append(f'<rect id="shadow-{name}" x="{x}" y="{y0}" width="{w}" height="{h}" style="fill:url(#{gid_})"/>')
+            x += max(w, 1) + 4
+        parts.append(f'<rect id="shadow-center" x="{x}" y="{y0}" width="1" height="1" style="fill:none"/>')
+        for side, val in (("top", int(S * 0.6)), ("bottom", S), ("left", int(S * 0.8)), ("right", int(S * 0.8))):
+            if side in ("top", "bottom"):
+                parts.append(f'<rect id="shadow-hint-{side}-margin" x="{x+4}" y="{y0}" width="1" height="{val}" style="fill:none"/>')
+            else:
+                parts.append(f'<rect id="shadow-hint-{side}-margin" x="{x+8}" y="{y0}" width="{val}" height="1" style="fill:none"/>')
+
+    style = ('<style type="text/css" id="current-color-scheme">'
+             ".ColorScheme-Background{color:#10191c;}.ColorScheme-Highlight{color:#39c5bb;}"
+             ".ColorScheme-Text{color:#e4f5f3;}</style>")
+    return ('<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<svg xmlns="http://www.w3.org/2000/svg" width="400" height="200" viewBox="0 0 400 200">'
+            f"<defs>{style}{''.join(defs)}</defs>{''.join(parts)}</svg>\n")
+
+
+def generate_desktoptheme(cfg):
+    st = cfg["style"]
+    root = os.path.join(XDG_DATA, "plasma", "desktoptheme", THEME_NAME)
+    r = int(st.get("radius", 14))
+    bo = float(st.get("borderOpacity", 0.35))
+    pan = float(st.get("panelOpacity", 0.8))
+    pop = float(st.get("popupOpacity", 0.92))
+    wid = float(st.get("widgetOpacity", 0.72))
+    pm = max(3, min(8, r // 3))
+    dm = max(6, min(12, r // 2 + 2))
+    specs = {
+        "widgets/panel-background.svg": (r, pan, bo, (pm, pm, pm, pm), ("", "north", "south", "east", "west"), 14, False),
+        "dialogs/background.svg": (r, pop, bo, (dm, dm, dm, dm), ("",), 18, True),
+        "widgets/tooltip.svg": (max(6, r - 4), pop, bo, (6, 6, 8, 8), ("",), 12, True),
+        "widgets/background.svg": (r, wid, bo * 0.8, (dm, dm, dm, dm), ("",), 10, True),
+    }
+    for rel, (rad, op, b, margins, prefixes, sh, cb) in specs.items():
+        variants = {"": op, "translucent/": op, "opaque/": 1.0, "solid/": 1.0}
+        for vdir, vop in variants.items():
+            if vdir == "solid/" and "panel" not in rel:
+                continue
+            write_atomic(os.path.join(root, vdir + rel), frame_svg(rad, vop, b, margins, prefixes, sh, corner_border=cb))
+    meta = {
+        "KPlugin": {
+            "Authors": [{"Name": "AnimeStage"}],
+            "Description": "AnimeStage dark style – follows the AnimeStage color scheme",
+            "Id": THEME_NAME,
+            "License": "MIT",
+            "Name": THEME_NAME,
+            "Version": "1.0",
+        },
+        "X-Plasma-API": "5.0",
+    }
+    write_atomic(os.path.join(root, "metadata.json"), json.dumps(meta, indent=4) + "\n")
+    # Blur/contrast stay at Plasma's defaults (like Breeze): custom,
+    # stronger values let the wallpaper shine through at the panel ends.
+    write_atomic(os.path.join(root, "plasmarc"), "[AdaptiveTransparency]\nenabled=true\n")
+    return root
+
+
+def apply_style(cfg, reload=True):
+    generate_desktoptheme(cfg)
+    if not reload:
+        return
+    for name in os.listdir(XDG_CACHE) if os.path.isdir(XDG_CACHE) else []:
+        if name.startswith(("plasma_theme_", "plasma-svgelements", "ksvg-elements")):
+            target = os.path.join(XDG_CACHE, name)
+            try:
+                shutil.rmtree(target) if os.path.isdir(target) else os.remove(target)
+            except OSError:
+                pass
+    current = run(["kreadconfig6", "--file", "plasmarc", "--group", "Theme", "--key", "name"])
+    if current and current.stdout.strip() == THEME_NAME:
+        run(["plasma-apply-desktoptheme", "breeze-dark"])
+        time.sleep(0.4)
+    run(["plasma-apply-desktoptheme", THEME_NAME])
+    say(_('Plasma-Stil angewendet'))
+
+
+# --------------------------------------------------------------------------
+# Window decoration
+# --------------------------------------------------------------------------
+
+def aurorae_button(color, glyph, muted, bg):
+    def circle(fill, op, extra=""):
+        return f'<circle cx="12" cy="12" r="7" style="fill:{fill};fill-opacity:{op}"/>{extra}'
+    g = ""
+    if glyph == "close":
+        g = '<path d="M9.2,9.2 L14.8,14.8 M14.8,9.2 L9.2,14.8" style="fill:none;stroke:%s;stroke-width:1.6;stroke-linecap:round"/>' % bg
+    elif glyph == "max":
+        g = '<rect x="9" y="9" width="6" height="6" rx="1.2" style="fill:none;stroke:%s;stroke-width:1.5"/>' % bg
+    elif glyph == "min":
+        g = '<path d="M8.8,12 H15.2" style="fill:none;stroke:%s;stroke-width:1.6;stroke-linecap:round"/>' % bg
+    elif glyph == "restore":
+        g = '<path d="M9.5,10.5 h4 v4 h-4 z M11,9 h4 v4" style="fill:none;stroke:%s;stroke-width:1.3"/>' % bg
+    else:
+        g = '<circle cx="12" cy="12" r="1.8" style="fill:%s"/>' % bg
+    els = {
+        "active": circle(color, 0.95),
+        "hover": circle(lighten(color, 0.2), 1, g),
+        "pressed": circle(darken(color, 0.25), 1, g),
+        "inactive": circle(muted, 0.35),
+        "inactive-hover": circle(color, 0.8, g),
+        "deactivated": circle(muted, 0.2),
+        "inactive-deactivated": circle(muted, 0.15),
+    }
+    body = "".join(f'<g id="{k}"><rect x="0" y="0" width="24" height="24" style="fill:#000;fill-opacity:0"/>{v}</g>'
+                   for k, v in els.items())
+    return f'<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">{body}</svg>\n'
+
+
+def aurorae_decoration(p, radius):
+    # Flat frame: title bar in surface color, accent line on top,
+    # 1px border in muted accent color.
+    H, B, E, R = 34, 1, 8, max(2, min(12, radius - 2))
+    out = []
+
+    def frame(prefix, top_fill, edge_color, stripe):
+        x0 = 0 if "inactive" not in prefix else 80
+        coords = {
+            "topleft": (x0, 0, R, H), "top": (x0 + R, 0, E, H), "topright": (x0 + R + E, 0, R, H),
+            "left": (x0, H, B, E), "center": (x0 + R, H, E, E), "right": (x0 + R + E, H, B, E),
+            "bottomleft": (x0, H + E, B, B), "bottom": (x0 + R, H + E, E, B),
+            "bottomright": (x0 + R + E, H + E, B, B),
+        }
+        for name, (x, y, w, h) in coords.items():
+            inner = [f'<rect x="{x}" y="{y}" width="{w}" height="{h}" style="fill:#000;fill-opacity:0"/>']
+            if name == "topleft":
+                inner.append(f'<path d="M{x},{y+h} V{y+R} A{R},{R} 0 0 1 {x+R},{y} V{y+h} Z" style="fill:{top_fill}"/>')
+                if stripe:
+                    inner.append(f'<path d="M{x+0.6},{y+R} A{R-0.6},{R-0.6} 0 0 1 {x+R},{y+0.6}" style="fill:none;stroke:{stripe};stroke-width:1.6"/>')
+                inner.append(f'<path d="M{x+0.5},{y+h} V{y+R}" style="fill:none;stroke:{edge_color};stroke-width:1"/>')
+            elif name == "topright":
+                inner.append(f'<path d="M{x},{y} A{R},{R} 0 0 1 {x+R},{y+R} V{y+h} H{x} Z" style="fill:{top_fill}"/>')
+                if stripe:
+                    inner.append(f'<path d="M{x},{y+0.6} A{R-0.6},{R-0.6} 0 0 1 {x+R-0.6},{y+R}" style="fill:none;stroke:{stripe};stroke-width:1.6"/>')
+                inner.append(f'<path d="M{x+R-0.5},{y+R} V{y+h}" style="fill:none;stroke:{edge_color};stroke-width:1"/>')
+            elif name == "top":
+                inner.append(f'<rect x="{x}" y="{y}" width="{w}" height="{h}" style="fill:{top_fill}"/>')
+                if stripe:
+                    inner.append(f'<rect x="{x}" y="{y}" width="{w}" height="1.6" style="fill:{stripe}"/>')
+            elif name == "center":
+                inner.append(f'<rect x="{x}" y="{y}" width="{w}" height="{h}" style="fill:{top_fill}"/>')
+            else:
+                inner.append(f'<rect x="{x}" y="{y}" width="{w}" height="{h}" style="fill:{edge_color}"/>')
+            out.append(f'<g id="{prefix}-{name}">' + "".join(inner) + "</g>")
+
+    head = mix(p["bg"], p["surface"], 0.6)
+    frame("decoration", head, mix(p["accent"], p["bg"], 0.55), p["accent"])
+    frame("decoration-inactive", p["bg"], mix(p["muted"], p["bg"], 0.6), None)
+    return f'<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" width="200" height="60" viewBox="0 0 200 60">{"".join(out)}</svg>\n'
+
+
+def generate_aurorae(cfg):
+    p = palette(cfg)
+    root = os.path.join(XDG_DATA, "aurorae", "themes", THEME_NAME)
+    write_atomic(os.path.join(root, "decoration.svg"), aurorae_decoration(p, int(cfg["style"]["radius"])))
+    bg = darken(p["bg"], 0.1)
+    buttons = {
+        "close": (p["accent2"], "close"), "maximize": (p["accent"], "max"),
+        "restore": (p["accent"], "restore"), "minimize": (p["neutral"], "min"),
+        "alldesktops": (p["muted"], "dot"), "keepabove": (p["muted"], "dot"),
+        "keepbelow": (p["muted"], "dot"), "shade": (p["muted"], "dot"), "help": (p["muted"], "dot"),
+    }
+    for name, (col, glyph) in buttons.items():
+        write_atomic(os.path.join(root, f"{name}.svg"), aurorae_button(col, glyph, p["muted"], bg))
+    write_atomic(os.path.join(root, "metadata.desktop"), "\n".join([
+        "[Desktop Entry]", f"Name={THEME_NAME}", "Comment=AnimeStage flat window decoration",
+        "X-KDE-PluginInfo-Author=AnimeStage", f"X-KDE-PluginInfo-Name={THEME_NAME}",
+        "X-KDE-PluginInfo-Version=1.0", "X-KDE-PluginInfo-License=MIT", "",
+    ]))
+    write_atomic(os.path.join(root, f"{THEME_NAME}rc"), "\n".join([
+        "[General]", f"ActiveTextColor={csv(p['text'])}", f"InactiveTextColor={csv(p['muted'])}",
+        "TitleAlignment=Center", "TitleVerticalAlignment=Center", "Animation=120",
+        "UseTextShadow=false", "", "[Layout]",
+        "BorderLeft=1", "BorderRight=1", "BorderBottom=1",
+        "TitleEdgeTop=5", "TitleEdgeBottom=5", "TitleEdgeLeft=6", "TitleEdgeRight=6",
+        "TitleBorderLeft=8", "TitleBorderRight=8", "TitleHeight=24",
+        "ButtonWidth=24", "ButtonHeight=24", "ButtonSpacing=2", "ButtonMarginTop=0",
+        "ExplicitButtonSpacer=8", "PaddingTop=0", "PaddingBottom=0", "PaddingLeft=0", "PaddingRight=0", "",
+    ]))
+
+
+def apply_deco(cfg):
+    mode = cfg["style"].get("windowDeco", "breeze")
+    group = ["--file", "kwinrc", "--group", "org.kde.kdecoration2"]
+    if mode == "aurorae":
+        generate_aurorae(cfg)
+        run(["kwriteconfig6", *group, "--key", "library", "org.kde.kwin.aurorae"])
+        run(["kwriteconfig6", *group, "--key", "theme", f"__aurorae__svg__{THEME_NAME}"])
+    else:
+        run(["kwriteconfig6", *group, "--key", "library", "org.kde.breeze"])
+        run(["kwriteconfig6", *group, "--key", "theme", "Breeze"])
+        breeze = ["--file", "breezerc"]
+        run(["kwriteconfig6", *breeze, "--group", "Common", "--key", "OutlineIntensity", "OutlineMedium"])
+        run(["kwriteconfig6", *breeze, "--group", "Common", "--key", "ShadowSize", "ShadowLarge"])
+        run(["kwriteconfig6", *breeze, "--group", "Windeco", "--key", "DrawTitleBarSeparator", "false"])
+        run(["kwriteconfig6", *breeze, "--group", "Windeco", "--key", "TitleAlignment", "AlignCenterFullWidth"])
+        run(["kwriteconfig6", *breeze, "--group", "Windeco", "--key", "ButtonSize", "ButtonDefault"])
+    run([qdbus(), "org.kde.KWin", "/KWin", "reconfigure"])
+    say(_('Fensterrahmen: {mode}', mode=mode))
+
+
+# --------------------------------------------------------------------------
+# Konsole, Kvantum, font
+# --------------------------------------------------------------------------
+
+def terminal_font():
+    """Monospace font for Konsole: the first installed one from the list."""
+    res = run(["fc-list", ":spacing=mono", "family"])
+    fonts = set()
+    if res and res.returncode == 0:
+        for line in res.stdout.splitlines():
+            fonts.update(f.strip() for f in line.split(","))
+    for name in ("JetBrainsMono Nerd Font", "FiraCode Nerd Font", "Fira Code", "JetBrains Mono", "Hack"):
+        if name in fonts:
+            return name
+    return "Monospace"
+
+
+def kvantum_base():
+    for root in ("/usr/share/Kvantum", "/usr/local/share/Kvantum", os.path.join(XDG_DATA, "Kvantum")):
+        for name in ("KvArcDark", "KvGnomeDark", "KvFlat"):
+            svg = os.path.join(root, name, f"{name}.svg")
+            if os.path.exists(svg):
+                return root, name
+    return None, None
+
+
+def apply_kvantum(cfg):
+    mode = cfg["style"].get("appStyle", "breeze")
+    if mode != "kvantum":
+        run(["kwriteconfig6", "--file", "kdeglobals", "--group", "KDE", "--key", "widgetStyle", "Breeze"])
+        return
+    root, base = kvantum_base()
+    if not base or not have("kvantummanager"):
+        say(_('Kvantum ist nicht installiert (Bazzite: rpm-ostree install kvantum) – bleibe bei Breeze'))
+        return
+    p = palette(cfg)
+    svg = open(os.path.join(root, base, f"{base}.svg"), encoding="utf-8").read()
+    conf = open(os.path.join(root, base, f"{base}.kvconfig"), encoding="utf-8").read()
+    # Map the typical Arc/GNOME colors onto the AnimeStage palette.
+    swaps = {
+        "#5294e2": p["accent"], "#4a90d9": p["accent"], "#3daee9": p["accent"],
+        "#383c4a": p["surface"], "#404552": p["surfaceAlt"], "#2f343f": p["bg"],
+        "#353945": p["surface"], "#4b5162": p["surfaceAlt"], "#d3dae3": p["text"],
+        "#353535": p["surface"], "#2d2d2d": p["bg"], "#3c3c3c": p["surfaceAlt"],
+    }
+    for old, new in swaps.items():
+        svg = re.sub(re.escape(old), new, svg, flags=re.I)
+        conf = re.sub(re.escape(old), new, conf, flags=re.I)
+    dest = os.path.join(XDG_CONFIG, "Kvantum", THEME_NAME)
+    write_atomic(os.path.join(dest, f"{THEME_NAME}.svg"), svg)
+    write_atomic(os.path.join(dest, f"{THEME_NAME}.kvconfig"), conf)
+    run(["kvantummanager", "--set", THEME_NAME])
+    run(["kwriteconfig6", "--file", "kdeglobals", "--group", "KDE", "--key", "widgetStyle", "kvantum"])
+    say(_('Kvantum-Stil aus {base} abgeleitet', base=base))
+
+
+def install_fonts():
+    dest = os.path.join(XDG_DATA, "fonts", "animestage")
+    os.makedirs(dest, exist_ok=True)
+    got = 0
+    for w in FONT_FILES:
+        path = os.path.join(dest, f"MPLUSRounded1c-{w}.ttf")
+        if os.path.exists(path) and os.path.getsize(path) > 10000:
+            got += 1
+            continue
+        try:
+            data = http_get(FONT_URL.format(w))
+            write_atomic(path, data, binary=True)
+            got += 1
+        except Exception as exc:
+            log(f"font {w}: {exc}")
+    if have("fc-cache"):
+        run(["fc-cache", "-f", dest])
+    say(_('Schrift M PLUS Rounded 1c: {got}/{total} Schnitte', got=got, total=len(FONT_FILES)))
+
+
+def apply_font(cfg):
+    st = cfg["style"]
+    fam = st.get("font") or "M PLUS Rounded 1c"
+    if st.get("uiFont"):
+        vals = {"font": 10, "menuFont": 10, "toolBarFont": 10, "smallestReadableFont": 8}
+        for key, size in vals.items():
+            run(["kwriteconfig6", "--file", "kdeglobals", "--group", "General", "--key", key,
+                 f"{fam},{size},-1,5,400,0,0,0,0,0,0,0,0,0,0,1"])
+        run(["kwriteconfig6", "--file", "kdeglobals", "--group", "WM", "--key", "activeFont",
+             f"{fam},10,-1,5,700,0,0,0,0,0,0,0,0,0,0,1"])
+        say(_('Systemschrift: {fam} (wirkt nach Neustart der Programme)', fam=fam))
+
+
+# --------------------------------------------------------------------------
+# Icons: Papirus-Dark with folders in exactly the accent color
+# --------------------------------------------------------------------------
+
+def icons_root():
+    return os.path.join(XDG_DATA, "icons")
+
+
+def install_icons():
+    root = icons_root()
+    marker = os.path.join(root, "Papirus", ".animestage")
+    if os.path.exists(marker) and os.path.isdir(os.path.join(root, "Papirus-Dark")):
+        return True
+    if os.path.isdir(os.path.join(root, "Papirus")) and not os.path.exists(marker):
+        say(_('Eigenes Papirus gefunden – nutze es, ohne es zu verändern'))
+        return True
+    say(_('Lade Papirus-Icons {version} (~33 MB)', version=PAPIRUS_TAG))
+    archive = os.path.join(XDG_CACHE, "animestage", f"papirus-{PAPIRUS_TAG}.tar.gz")
+    if not os.path.exists(archive):
+        write_atomic(archive, http_get(PAPIRUS_URL, 300), binary=True)
+    with tarfile.open(archive) as tf:
+        members = []
+        for m in tf.getmembers():
+            parts = m.name.split("/", 2)
+            if len(parts) >= 2 and parts[1] in ("Papirus", "Papirus-Dark"):
+                m.name = "/".join(parts[1:])
+                members.append(m)
+        tf.extractall(root, members=members, filter="data")
+    open(marker, "w").close()
+    say(_('Papirus-Dark installiert'))
+    return True
+
+
+def recolor_folders(cfg):
+    """Creates folder-animestage*/user-animestage* in the accent color and points the
+    default names (folder.svg, user-home.svg …) at them."""
+    p = palette(cfg)
+    light, dark = p["accent"], darken(p["accent"], 0.22)
+    count = 0
+    for theme in ("Papirus", "Papirus-Dark"):
+        base = os.path.join(icons_root(), theme)
+        if not os.path.exists(os.path.join(icons_root(), "Papirus", ".animestage")):
+            return 0
+        for root, _dirs, files in os.walk(base):
+            if os.path.basename(root) != "places":
+                continue
+            for name in files:
+                path = os.path.join(root, name)
+                m = re.match(r"^(folder|user)-blue(-.*)?\.svg$", name)
+                if m and not os.path.islink(path):
+                    svg = open(path, encoding="utf-8").read()
+                    svg = re.sub(PAPIRUS_BLUE[0], light, svg, flags=re.I)
+                    svg = re.sub(PAPIRUS_BLUE[1], dark, svg, flags=re.I)
+                    with open(os.path.join(root, f"{m.group(1)}-animestage{m.group(2) or ''}.svg"), "w", encoding="utf-8") as fh:
+                        fh.write(svg)
+                    count += 1
+            for name in files:
+                path = os.path.join(root, name)
+                if not os.path.islink(path) or re.match(r"^(folder|user)-(blue|animestage)", name):
+                    continue
+                target = os.readlink(path)
+                head, tail = os.path.split(target)
+                m = re.match(r"^(folder|user)-(blue|animestage)(-.*)?\.svg$", tail)
+                if not m:
+                    continue
+                new_tail = f"{m.group(1)}-animestage{m.group(3) or ''}.svg"
+                if os.path.exists(os.path.join(root, head, new_tail)) and tail != new_tail:
+                    os.remove(path)
+                    os.symlink(os.path.join(head, new_tail) if head else new_tail, path)
+    return count
+
+
+def apply_icons(cfg):
+    if cfg["style"].get("icons", "papirus") != "papirus":
+        return
+    install_icons()
+    n = recolor_folders(cfg)
+    for name in os.listdir(XDG_CACHE) if os.path.isdir(XDG_CACHE) else []:
+        if name.startswith("icon-cache"):
+            try:
+                os.remove(os.path.join(XDG_CACHE, name))
+            except OSError:
+                pass
+    current = run(["kreadconfig6", "--file", "kdeglobals", "--group", "Icons", "--key", "Theme"])
+    changer = "/usr/libexec/plasma-changeicons"
+    if current and current.stdout.strip() == "Papirus-Dark":
+        # same theme: switch briefly so recolored folders get reloaded
+        run([changer, "breeze-dark"])
+        time.sleep(0.3)
+    run([changer, "Papirus-Dark"]) if os.path.exists(changer) else run(
+        ["kwriteconfig6", "--file", "kdeglobals", "--group", "Icons", "--key", "Theme", "Papirus-Dark"])
+    say(_("Icons: Papirus-Dark, {n} Ordner-Icons in {color}", n=n, color=palette(cfg)['accent']))
+
+
+# --------------------------------------------------------------------------
+# Wallpaper, lock screen, splash
+# --------------------------------------------------------------------------
+
+def image_or_default(cfg, slot):
+    """Chosen image for a slot, otherwise a matching one from the current anime."""
+    path = cfg["images"].get(slot) or ""
+    if path and os.path.exists(path):
+        return path
+    a = cfg.get("anime") or {}
+    if slot in ("launcher", "splash"):
+        imgs = list_images(cfg)
+        cuts = [it["path"] for it in imgs if it["source"] == "freisteller"]
+        if cuts:
+            return cuts[0]
+        return a.get("cover") or ""
+    if slot in ("wallpaper", "lock"):
+        cur = wall_state()["current"]
+        if cur and os.path.exists(cur) and (slot == "wallpaper" or is_safe(cur)):
+            return cur
+        return a.get("banner") or a.get("cover") or ""
+    return ""
+
+
+def ensure_wall_timer(cfg):
+    """Self-healing: rotation is enabled but the timer is missing or not running
+    (e.g. after migrating from VocaStage) → set it up again."""
+    if not wall_cfg(cfg)["enabled"]:
+        return
+    tmr = os.path.join(XDG_CONFIG, "systemd", "user", "animestage-wall.timer")
+    active = subprocess.run(["systemctl", "--user", "is-active", "--quiet", "animestage-wall.timer"]).returncode == 0
+    if not os.path.exists(tmr) or not active:
+        wall_timer(cfg, True)
+
+
+def apply_wallpaper(cfg):
+    if wall_cfg(cfg)["enabled"]:
+        ensure_wall_timer(cfg)
+        return  # automatic rotation takes care of it
+    path = image_or_default(cfg, "wallpaper")
+    if not path:
+        say(_('Kein Hintergrundbild vorhanden – erst im Kontrollzentrum einen Anime wählen'))
+        return
+    run(["plasma-apply-wallpaperimage", path])
+    export_login(path)
+    say(_('Hintergrund: {path}', path=os.path.basename(path)))
+
+
+def apply_lock(cfg):
+    path = image_or_default(cfg, "lock") or image_or_default(cfg, "wallpaper")
+    if not path:
+        return
+    base = ["--file", "kscreenlockerrc", "--group", "Greeter"]
+    run(["kwriteconfig6", *base, "--key", "WallpaperPlugin", "org.kde.image"])
+    for key in ("Image", "PreviewImage"):
+        run(["kwriteconfig6", *base, "--group", "Wallpaper", "--group", "org.kde.image", "--group", "General",
+             "--key", key, "file://" + path])
+    say(_('Sperrbildschirm-Hintergrund gesetzt'))
+
+
+def lnf_root():
+    return os.path.join(XDG_DATA, "plasma", "look-and-feel", LNF_ID)
+
+
+def apply_splash(cfg):
+    root = lnf_root()
+    if not os.path.isdir(root):
+        say(_('Look-and-Feel-Paket fehlt – Splash übersprungen'))
+        return
+    p = palette(cfg)
+    a = cfg.get("anime") or {}
+    img = image_or_default(cfg, "splash")
+    splash = os.path.join(root, "contents", "splash")
+    os.makedirs(os.path.join(splash, "images"), exist_ok=True)
+    hero = os.path.join(splash, "images", "hero.png")
+    if img:
+        try:
+            from PIL import Image
+            im = Image.open(img)
+            im.thumbnail((1200, 1400))
+            im.save(hero)
+        except Exception:
+            shutil.copyfile(img, hero)
+    data = {k: p[k] for k in ("bg", "surface", "accent", "accent2", "text", "muted")}
+    data.update({"name": a.get("title") or "AnimeStage", "jp": a.get("native") or "",
+                 "number": " · ".join(str(x) for x in (a.get("format"), a.get("year")) if x), "hasHero": bool(img)})
+    write_atomic(os.path.join(splash, "theme.js"), ".pragma library\nvar t = " + json.dumps(data, ensure_ascii=False) + ";\n")
+    run(["kwriteconfig6", "--file", "ksplashrc", "--group", "KSplash", "--key", "Engine", "KSplashQML"])
+    run(["kwriteconfig6", "--file", "ksplashrc", "--group", "KSplash", "--key", "Theme", LNF_ID])
+    say(_('Startbildschirm aktualisiert'))
+
+
+# --------------------------------------------------------------------------
+# Network & images
+# --------------------------------------------------------------------------
+
+def http_get(url, timeout=60):
+    req = urllib.request.Request(url, headers=UA)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def http_json(url, timeout=30):
+    return json.loads(http_get(url, timeout))
+
+
+IMAGE_EXT = (".png", ".jpg", ".jpeg", ".webp")
+
+
+def make_thumb(path):
+    try:
+        from PIL import Image
+    except ImportError:
+        return path
+    os.makedirs(THUMB_DIR, exist_ok=True)
+    key = re.sub(r"[^A-Za-z0-9]+", "_", path)[-150:]
+    out = os.path.join(THUMB_DIR, key + ".png")
+    if os.path.exists(out) and os.path.getmtime(out) >= os.path.getmtime(path):
+        return out
+    try:
+        im = Image.open(path)
+        im.thumbnail((360, 360))
+        if im.mode not in ("RGBA", "RGB"):
+            im = im.convert("RGBA")
+        im.save(out)
+    except Exception as exc:
+        log(f"thumb {path}: {exc}")
+        return path
+    return out
+
+
+def folder_images(cfg):
+    """Images from own folders (one level of subfolders), without copying them."""
+    out = []
+    for folder in cfg.get("folders") or []:
+        folder = os.path.expanduser(folder)
+        if not os.path.isdir(folder):
+            continue
+        for root, dirs, files in os.walk(folder):
+            if os.path.relpath(root, folder).count(os.sep) >= 1:
+                dirs[:] = []
+            for name in sorted(files):
+                if name.lower().endswith(IMAGE_EXT) and not name.startswith("."):
+                    path = os.path.join(root, name)
+                    out.append({"path": path, "thumb": make_thumb(path), "source": "ordner",
+                                "id": name, "artist": os.path.basename(root), "page": ""})
+    return out
+
+
+# --------------------------------------------------------------------------
+# Anime: AniList (search, characters, ages) + Konachan/Danbooru tags
+# --------------------------------------------------------------------------
+
+ANILIST = "https://graphql.anilist.co"
+ANIME_DIR = os.path.join(DATA_DIR, "anime")
+
+
+def anilist(query, variables):
+    body = json.dumps({"query": query, "variables": variables}).encode()
+    req = urllib.request.Request(ANILIST, data=body, headers={
+        **UA, "Content-Type": "application/json", "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        data = json.loads(resp.read())
+    if data.get("errors"):
+        raise RuntimeError(data["errors"][0].get("message", "AniList-Fehler"))
+    return data["data"]
+
+
+def anime_search(text):
+    q = """query($s:String){Page(perPage:12){media(search:$s,type:ANIME,sort:SEARCH_MATCH,isAdult:false){
+        id title{romaji english native} seasonYear format episodes coverImage{large color} averageScore}}}"""
+    out = []
+    for m in anilist(q, {"s": text})["Page"]["media"]:
+        out.append({"id": m["id"], "title": m["title"]["english"] or m["title"]["romaji"],
+                    "romaji": m["title"]["romaji"], "native": m["title"]["native"] or "",
+                    "year": m["seasonYear"], "format": m["format"], "episodes": m["episodes"],
+                    "cover": m["coverImage"]["large"], "color": m["coverImage"]["color"], "score": m["averageScore"]})
+    return out
+
+
+def parse_age(text):
+    """AniList age → (min, max) or None. "15-" → (15, None), "Late 20s" → (20, 29), "29" → (29, 29)."""
+    if not text:
+        return None
+    nums = [int(n) for n in re.findall(r"\d+", str(text))]
+    if not nums:
+        return None
+    return min(nums), max(nums)
+
+
+def char_adult(ch):
+    """Adult if AniList confirms it (youngest stated age 18–99) or you marked the
+    character yourself. Anyone under 18 at any point according to AniList stays locked.
+    Fantasy ages of 100+ ("1000+") say nothing about appearance → treated as "unknown"."""
+    age = parse_age(ch.get("age"))
+    if age and age[0] < 18:
+        return False
+    if age and age[0] < 100:
+        return True
+    return bool(ch.get("markedAdult"))
+
+
+def char_lockable(ch):
+    """May the character be marked as adult manually? Only without an age or with a fantasy age."""
+    age = parse_age(ch.get("age"))
+    return age is None or age[0] >= 100
+
+
+def booru_tags(src, name, kind):
+    """Tags of an image source; kind = "copyright" (series) or "character"."""
+    try:
+        return src.tags(name, kind)
+    except Exception as exc:
+        log(f"tags {src.name} {name}: {exc}")
+        return []
+
+
+def slug(text):
+    return re.sub(r"[^a-z0-9]+", "_", (text or "").lower()).strip("_")
+
+
+def find_copyright(src, media):
+    """Find the copyright tag (e.g. shingeki_no_kyojin) via the romaji/English title."""
+    cands = []
+    for title in (media["title"]["romaji"], media["title"]["english"]):
+        if not title:
+            continue
+        s = slug(title)
+        words = [w for w in s.split("_") if len(w) > 2]
+        for probe in [s] + words[:2]:
+            for name, count in booru_tags(src, probe, "copyright"):
+                score = count
+                if name == s:
+                    score += 10 ** 7
+                elif name.startswith(s) or s.startswith(name):
+                    score += 10 ** 6
+                elif all(w in name for w in words[:2]):
+                    score += 10 ** 5
+                else:
+                    continue
+                cands.append((score, name))
+            if cands:
+                break
+    return max(cands)[1] if cands else ""
+
+
+def find_char_tag(src, ch, copyright_tag):
+    """Find the character tag, tolerant of romanization variants (Blouse/Browse, Lenz/Renz …):
+    candidates via first names (also AniList alternative names), name similarity,
+    and when unsure a cross-check that character and series appear together in images."""
+    import difflib
+    names = [ch["name"]["full"]] + [n for n in (ch["name"].get("alternative") or [])
+                                    if n and n.isascii() and len(n.split()) <= 3]
+    slugs = [slug(n) for n in names if slug(n)]
+    # Japanese name order: AniList "Kazuma Satou" → tag "satou_kazuma"
+    for sl in list(slugs):
+        parts = sl.split("_")
+        if len(parts) == 2 and f"{parts[1]}_{parts[0]}" not in slugs:
+            slugs.append(f"{parts[1]}_{parts[0]}")
+    main_first = slugs[0].split("_")[0] if slugs else ""
+    probes = []
+    for k, sl in enumerate(slugs):
+        cands_ = [sl]
+        # first name as search term – for alternative names only if it's not a title
+        # ("Captain Levi" contains the actual name → don't use "captain")
+        if k == 0 or main_first not in sl.split("_")[1:]:
+            cands_.append(sl.split("_")[0])
+        for probe in cands_:
+            if len(probe) >= 3 and probe not in probes:
+                probes.append(probe)
+    cands = {}
+    for probe in probes[:4]:
+        for name, count in booru_tags(src, probe, "character"):
+            m = re.match(r"^(.*?)_\((.*)\)$", name)
+            base = m.group(1) if m else name
+            if not (probe.split("_")[0] in base.split("_") or base == probe):
+                continue
+            score = max(difflib.SequenceMatcher(None, sl, base).ratio() for sl in slugs)
+            if copyright_tag and name.endswith(f"_({copyright_tag})"):
+                score += 0.3
+            elif m:
+                # other qualifier ("darkness_(konosuba)" instead of the long copyright tag) – only with
+                # a cross-check that character and series appear together in images
+                score = min(score, 0.9)
+            # single-name character ("Levi") → tag with that first name + cross-check
+            if "_" not in slugs[0] and base.split("_")[0] == main_first:
+                score = max(score, 0.75)
+            if count > 0:
+                cands[name] = (score, count)
+    ranked = sorted(cands.items(), key=lambda kv: (-kv[1][0], -kv[1][1]))
+    for name, (score, count) in ranked[:3]:
+        if score < 0.7:
+            break
+        if score >= 0.92:
+            return name
+        try:
+            # cross-check: several shared images with the series (single crossovers don't count)
+            hit = src.search([copyright_tag, name], rating=None, limit=3, random=False)
+            if len(hit) >= 2:
+                return name
+        except Exception:
+            continue
+    return ""
+
+
+def anime_set(cfg, anime_id, quiet=False):
+    """Adopt an anime: data from AniList, tags from Konachan/Danbooru, cover/banner,
+    cutouts. Then apply the theme and fetch the first wallpaper."""
+    q = """query($id:Int){Media(id:$id,type:ANIME){id title{romaji english native} seasonYear format
+        coverImage{extraLarge color} bannerImage
+        characters(sort:[ROLE,FAVOURITES_DESC],perPage:25){edges{role node{id name{full native alternative} age gender image{large}}}}}}"""
+    m = anilist(q, {"id": int(anime_id)})["Media"]
+    title = m["title"]["english"] or m["title"]["romaji"]
+    say(_('Anime: {title}', title=title))
+    folder = os.path.join(ANIME_DIR, str(m["id"]))
+    os.makedirs(os.path.join(folder, "chars"), exist_ok=True)
+
+    def grab(url, dest):
+        if url and not os.path.exists(dest):
+            try:
+                write_atomic(dest, http_get(url, 60), binary=True)
+            except Exception as exc:
+                log(f"download {url}: {exc}")
+        return dest if os.path.exists(dest) else ""
+
+    cover = grab(m["coverImage"]["extraLarge"], os.path.join(folder, "cover.jpg"))
+    banner = grab(m["bannerImage"], os.path.join(folder, "banner.jpg"))
+    ws, cs = wall_src(cfg), cut_src(cfg)
+    wall_tag = find_copyright(ws, m)
+    cut_tag = wall_tag if cs.name == ws.name else find_copyright(cs, m)
+    say("  " + _("{site}-Tag: {tag}", site=ws.name, tag=wall_tag or _("– nicht gefunden –"))
+        + "  ·  " + _("{site}-Tag: {tag}", site=cs.name, tag=cut_tag or "–"))
+
+    old = {c["id"]: c for c in (cfg.get("anime") or {}).get("characters", [])}
+    only_female = gender_pref(cfg) == "female"
+    chars, excluded = [], []
+    for e in m["characters"]["edges"]:
+        n = e["node"]
+        if only_female and (n["gender"] or "").lower() != "female":
+            # male characters: still remember the tag so images with them get filtered out
+            if len(excluded) < 6 and wall_tag:
+                tag = find_char_tag(ws, {"name": n["name"]}, wall_tag)
+                if tag:
+                    excluded.append(tag)
+            continue
+        ch = {"id": n["id"], "name": n["name"]["full"], "native": n["name"]["native"] or "",
+              "age": n["age"] or "", "gender": n["gender"] or "", "role": e["role"],
+              "image": grab(n["image"]["large"], os.path.join(folder, "chars", f"{n['id']}.jpg")),
+              "markedAdult": bool(old.get(n["id"], {}).get("markedAdult"))}
+        ch["tag"] = find_char_tag(ws, {"name": n["name"]}, wall_tag) if wall_tag else ""
+        if ch["tag"]:
+            chars.append(ch)
+            if not quiet:
+                say(f"  ✓ {ch['name']} → {ch['tag']}" + ("  " + _("(Alter {age})", age=ch["age"]) if ch["age"] else ""))
+        if len(chars) >= 14:
+            break
+
+    cfg["anime"] = {"id": m["id"], "title": title, "romaji": m["title"]["romaji"],
+                    "native": m["title"]["native"] or "", "year": m["seasonYear"], "format": m["format"],
+                    "color": m["coverImage"]["color"] or "", "cover": cover, "banner": banner,
+                    "wallTag": wall_tag, "cutTag": cut_tag, "excludedTags": excluded, "tagSites": {"wallpaper": ws.name, "cutouts": cs.name},
+                    "characters": chars}
+    # character selection is per anime
+    cfg["wallswitch"] = dict(wall_cfg(cfg), chars=[])
+    t = cfg.setdefault("terminal", {})
+    t["chars"] = []
+    for slot in ("launcher", "splash"):
+        cfg["images"][slot] = ""
+    save_config(cfg)
+    if cut_tag:
+        fetch_cuts(cfg, 6, quiet=quiet)
+    return cfg
+
+
+# Filter out images with men when only female characters are wanted
+MALE_TAGS = {"male", "1boy", "2boys", "3boys", "4boys", "5boys", "6+boys", "multiple_boys", "male_focus"}
+
+
+def gender_pref(cfg):
+    return (cfg.get("characters") or {}).get("gender", "female")
+
+
+def unwanted_tags(cfg):
+    if gender_pref(cfg) != "female":
+        return set()
+    return MALE_TAGS | set((cfg.get("anime") or {}).get("excludedTags") or [])
+
+
+def anime_chars(cfg):
+    return (cfg.get("anime") or {}).get("characters", [])
+
+
+# ---- Cutouts (characters without background) from Danbooru – AI images are banned there
+
+CUT_BAD = {"ai-generated", "ai-assisted", "comic", "4koma", "multiple_views", "text_focus", "blood", "gore"}
+
+
+def cuts_dir(cfg):
+    return os.path.join(ANIME_DIR, str((cfg.get("anime") or {}).get("id", "none")), "cuts")
+
+
+def portrait(path):
+    """Portrait (full character) – wide effect images look too small in launcher/popups."""
+    try:
+        from PIL import Image
+        with Image.open(path) as im:
+            return im.height >= im.width * 1.15
+    except Exception:
+        return False
+
+
+def update_cut_list(cfg):
+    """Write the cutout list to the config – the widgets (popups, launcher) read it there."""
+    a = cfg.get("anime")
+    if not a:
+        return
+    folder = cuts_dir(cfg)
+    cuts = sorted(os.path.join(folder, n) for n in os.listdir(folder) if n.endswith(".png")) if os.path.isdir(folder) else []
+    # for popups/headers: only one character in the image and none excluded (e.g. male)
+    credits = load_json(os.path.join(folder, "credits.json"), {})
+    bad = unwanted_tags(cfg)
+    # only characters of this anime (Danbooru also tags crossovers, e.g. characters from games)
+    known = {c["tag"].split("_(")[0] for c in anime_chars(cfg) if c.get("tag")}
+    work = a.get("cutTag") or ""
+
+    def belongs(tag):
+        return tag.split("_(")[0] in known or (work and tag.endswith(f"_({work})"))
+    hero = []
+    for path in cuts:
+        chars = set((credits.get(os.path.splitext(os.path.basename(path))[0]) or {}).get("chars", "").split())
+        if len(chars) == 1 and not chars & bad and belongs(next(iter(chars))) and portrait(path):
+            hero.append(path)
+    if a.get("cutouts") != cuts or a.get("heroCuts") != hero:
+        a["cutouts"], a["heroCuts"] = cuts, hero
+        save_config(cfg)
+
+
+def fetch_cuts(cfg, count=6, quiet=False):
+    if count <= 0:
+        update_cut_list(cfg)
+        return 0
+    got = _fetch_cuts(cfg, count, quiet)
+    update_cut_list(cfg)
+    return got
+
+
+def _fetch_cuts(cfg, count, quiet):
+    from PIL import Image
+    import io
+    a = cfg.get("anime") or {}
+    src = cut_src(cfg)
+    if not a.get("cutTag"):
+        say(_('Für diesen Anime gibt es bei {name} keinen Tag – keine Freisteller', name=src.name))
+        return 0
+    folder = cuts_dir(cfg)
+    os.makedirs(folder, exist_ok=True)
+    have = {n.split(".")[0] for n in os.listdir(folder)}
+    got = 0
+    for page in range(1, 4):
+        try:
+            posts = src.search([a["cutTag"], "transparent_background"], rating="s", limit=100, random=False, page=page)
+        except Exception as exc:
+            log(f"freisteller {src.name}: {exc}")
+            break
+        if not posts:
+            break
+        posts.sort(key=lambda p: -p.get("score", 0))
+        for post in posts:
+            if got >= count:
+                break
+            pid = post["id"] if src.name == "danbooru" else post_key(post)
+            if pid in have or post.tagset & (CUT_BAD | unwanted_tags(cfg)) or post["ext"] != "png" or not post["url"]:
+                continue
+            if post["height"] < 700:
+                continue
+            try:
+                im = Image.open(io.BytesIO(sources.download(post["url"], 120)))
+                im = im.convert("RGBA")
+                box = im.getchannel("A").point(lambda v: 255 if v > 12 else 0).getbbox()
+                if box:
+                    im = im.crop(box)
+                im.thumbnail((1400, 1800))
+                dest = os.path.join(folder, f"{pid}.png")
+                im.save(dest, optimize=True)
+                meta = load_json(os.path.join(folder, "credits.json"), {})
+                meta[pid] = {"artist": post["author"] or "?", "page": post["page"], "chars": post["chars"] or ""}
+                write_atomic(os.path.join(folder, "credits.json"), json.dumps(meta, ensure_ascii=False))
+                got += 1
+                have.add(pid)
+                if not quiet:
+                    say("  ✓ " + _("Freisteller #{id} von {artist}", id=pid, artist=meta[pid]['artist']))
+                time.sleep(0.4)
+            except Exception as exc:
+                log(f"cut {pid}: {exc}")
+        if got >= count:
+            break
+    if not got and not quiet:
+        say(_('Keine (weiteren) Freisteller gefunden – Cover und Figurenbilder werden verwendet'))
+    return got
+
+
+def load_json(path, default):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return default
+
+
+def list_images(cfg):
+    """Images for launcher/splash: cutouts, character images, cover."""
+    out = []
+    a = cfg.get("anime") or {}
+    folder = cuts_dir(cfg)
+    credits = load_json(os.path.join(folder, "credits.json"), {})
+    if os.path.isdir(folder):
+        for n in sorted(os.listdir(folder)):
+            if n.endswith(".png"):
+                path = os.path.join(folder, n)
+                cr = credits.get(n.split(".")[0], {})
+                out.append({"path": path, "thumb": make_thumb(path), "source": "freisteller",
+                            "id": n, "artist": cr.get("artist", ""), "page": cr.get("page", "")})
+    for ch in a.get("characters", []):
+        if ch.get("image"):
+            out.append({"path": ch["image"], "thumb": make_thumb(ch["image"]), "source": "figur",
+                        "id": str(ch["id"]), "artist": ch["name"], "page": ""})
+    for key in ("cover", "banner"):
+        if a.get(key):
+            out.append({"path": a[key], "thumb": make_thumb(a[key]), "source": key, "id": key,
+                        "artist": "AniList", "page": f"https://anilist.co/anime/{a.get('id')}"})
+    return out
+
+
+# ---- Colors from the wallpaper
+
+def colors_from_image(path, current=None):
+    """Accent, second accent and dark surfaces from the image: the most vivid, most frequent
+    hues become accents, the background is a very dark tone of the image's mood."""
+    import colorsys
+    from PIL import Image
+    im = Image.open(path).convert("RGB")
+    im.thumbnail((200, 200))
+    q = im.quantize(16, method=Image.Quantize.MEDIANCUT)
+    pal = q.getpalette()[:48]
+    counts = sorted(q.getcolors(), reverse=True)
+    total = sum(c for c, _ in counts)
+    cands = []
+    for cnt, idx in counts:
+        r, g, b = pal[idx * 3:idx * 3 + 3]
+        h, l, s = colorsys.rgb_to_hls(r / 255, g / 255, b / 255)
+        # vivid, not too dark/light, and not just a single pixel
+        score = (s ** 1.2) * (1 - abs(l - 0.55) * 1.6) * ((cnt / total) ** 0.35)
+        cands.append((score, h, l, s))
+    cands.sort(reverse=True)
+
+    def tone(h, l, s):
+        r, g, b = colorsys.hls_to_rgb(h, l, s)
+        return rgb2hex((r * 255, g * 255, b * 255))
+
+    best = cands[0] if cands else (0, 0.48, 0.5, 0.6)
+    h1 = best[1]
+    s1 = max(0.55, min(0.95, best[3] * 1.15))
+    accent = tone(h1, 0.62, s1)
+    # second accent: a clearly different hue, otherwise a complementary neighbor
+    second = next((c for c in cands[1:] if min(abs(c[1] - h1), 1 - abs(c[1] - h1)) > 0.12 and c[3] > 0.25), None)
+    h2 = second[1] if second else (h1 + 0.42) % 1
+    accent2 = tone(h2, 0.62, max(0.5, min(0.85, (second[3] if second else 0.55) * 1.1)))
+    # background: average tone of the image, very dark and low saturation
+    avg = im.resize((1, 1), Image.LANCZOS).getpixel((0, 0))
+    ha, la, sa = colorsys.rgb_to_hls(*(v / 255 for v in avg))
+    bg = tone(ha, 0.065, min(0.35, sa * 0.8 + 0.08))
+    out = dict(current or {})
+    out.update({
+        "accent": accent, "accent2": accent2, "bg": bg,
+        "surface": mix(bg, accent, 0.05), "surfaceAlt": mix(lighten(bg, 0.06), accent, 0.08),
+        "text": mix("#F4F4F6", accent, 0.06), "muted": mix("#A7A9B2", accent, 0.18),
+    })
+    out.update({k: v for k, v in FIXED_COLORS.items() if k not in out})
+    return out
+
+
+def auto_colors(cfg, path, quiet=True):
+    """On every new wallpaper: adopt the colors and apply them lightly
+    (color scheme, terminal, widgets – without restarting Plasma)."""
+    if not (cfg.get("theme") or {}).get("autoColors", True) or not path or not os.path.isfile(path):
+        return
+    try:
+        cfg["colors"] = colors_from_image(path, cfg.get("colors"))
+    except Exception as exc:
+        log(f"farben: {exc}")
+        return
+    save_config(cfg)
+    for step in (apply_colors, apply_konsole, apply_firefox, apply_vscode):
+        try:
+            step(cfg)
+        except Exception as exc:
+            log(f"auto-farben {step.__name__}: {exc}")
+
+
+# --------------------------------------------------------------------------
+# Backup, Layout
+# --------------------------------------------------------------------------
+
+def backup(label=None):
+    stamp = label or datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    dest = os.path.join(BACKUP_DIR, stamp)
+    os.makedirs(dest, exist_ok=True)
+    absent = []
+    for rel in BACKUP_FILES:
+        src = os.path.join(XDG_CONFIG, rel)
+        if os.path.exists(src):
+            os.makedirs(os.path.dirname(os.path.join(dest, rel)), exist_ok=True)
+            shutil.copy2(src, os.path.join(dest, rel))
+        else:
+            absent.append(rel)
+    # files that didn't exist yet are removed again on restore (KDE defaults apply)
+    write_atomic(os.path.join(dest, ".absent"), "\n".join(absent) + "\n")
+    original = os.path.join(BACKUP_DIR, "original")
+    if not os.path.exists(original):
+        shutil.copytree(dest, original)
+    say(_('Backup: {dest}', dest=dest))
+    return dest
+
+
+def list_backups():
+    if not os.path.isdir(BACKUP_DIR):
+        return []
+    return sorted(os.listdir(BACKUP_DIR))
+
+
+def start_plasmashell():
+    """Start via systemd – otherwise Plasma inherits the calling terminal's environment."""
+    run(["systemctl", "--user", "reset-failed", "plasma-plasmashell.service"])
+    res = run(["systemctl", "--user", "start", "plasma-plasmashell.service"])
+    if res is None or res.returncode != 0:
+        subprocess.Popen(["kstart", "plasmashell"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def restore(name):
+    src = os.path.join(BACKUP_DIR, name)
+    if not os.path.isdir(src):
+        sys.exit(_('Backup nicht gefunden: {name} (vorhanden: {backups})', name=name, backups=', '.join(list_backups())))
+    run(["kquitapp6", "plasmashell"])
+    time.sleep(1.5)
+    run(["pkill", "-x", "plasmashell"])
+    for rel in BACKUP_FILES:
+        bfile = os.path.join(src, rel)
+        if os.path.exists(bfile):
+            os.makedirs(os.path.dirname(os.path.join(XDG_CONFIG, rel)), exist_ok=True)
+            shutil.copy2(bfile, os.path.join(XDG_CONFIG, rel))
+    absent_file = os.path.join(src, ".absent")
+    if os.path.exists(absent_file):
+        for rel in open(absent_file, encoding="utf-8").read().split():
+            if rel in BACKUP_FILES and os.path.exists(os.path.join(XDG_CONFIG, rel)):
+                os.remove(os.path.join(XDG_CONFIG, rel))
+    scheme = run(["kreadconfig6", "--file", "kdeglobals", "--group", "General", "--key", "ColorScheme"])
+    scheme = scheme.stdout.strip() if scheme else ""
+    if scheme:
+        run(["kwriteconfig6", "--file", "kdeglobals", "--group", "General", "--key", "ColorScheme", "AnimeStageReload"])
+        run(["plasma-apply-colorscheme", scheme])
+    start_plasmashell()
+    run([qdbus(), "org.kde.KWin", "/KWin", "reconfigure"])
+    say(_('Wiederhergestellt: {name}', name=name))
+
+
+def layout_script(cfg):
+    wall = image_or_default(cfg, "wallpaper")
+    kitty = os.path.exists(os.path.join(XDG_DATA, "applications", "kitty.desktop"))
+    term = "applications:kitty.desktop" if kitty else "applications:org.kde.konsole.desktop"
+    return """
+var terminal = %s;
+var wall = %s;
+var old = panels();
+for (var i = 0; i < old.length; ++i) { old[i].remove(); }
+
+var panel = new Panel;
+panel.location = "bottom";
+panel.height = Math.round(gridUnit * 2.8);
+try { panel.floating = true; } catch (e) {}
+try { panel.lengthMode = "fill"; } catch (e) {}
+panel.addWidget("org.animestage.launcher");
+var tasks = panel.addWidget(%s);
+tasks.currentConfigGroup = ["General"];
+tasks.writeConfig("launchers", ["applications:org.kde.dolphin.desktop", terminal, "preferred://browser", "applications:org.animestage.control.desktop"]);
+tasks.writeConfig("groupingStrategy", %d);
+tasks.writeConfig("taskMaxWidth", %d);
+tasks.writeConfig("separateLaunchers", false);
+panel.addWidget("org.kde.plasma.marginsseparator");
+panel.addWidget("org.animestage.media");
+panel.addWidget("org.animestage.system");
+panel.addWidget("org.kde.plasma.systemtray");
+panel.addWidget("org.animestage.clock");
+
+var ds = desktops();
+for (var j = 0; j < ds.length; ++j) {
+    var d = ds[j];
+    if (wall) {
+        d.wallpaperPlugin = "org.kde.image";
+        d.currentConfigGroup = ["Wallpaper", "org.kde.image", "General"];
+        d.writeConfig("Image", "file://" + wall);
+        d.writeConfig("FillMode", "2");
+    }
+    var w = d.widgets();
+    for (var k = 0; k < w.length; ++k) {
+        if (String(w[k].type).indexOf("org.animestage.") === 0) { w[k].remove(); }
+    }
+    // The desktop stays empty – everything important lives in the panel.
+}
+""" % (json.dumps(term), json.dumps("" if not wall else wall),
+       json.dumps(taskbar_type(cfg)), 1 if taskbar_cfg(cfg)["group"] else 0,
+       TASK_WIDTH.get(taskbar_cfg(cfg)["width"], 0))
+
+
+def apply_layout(cfg):
+    backup()
+    script = layout_script(cfg)
+    res = run([qdbus(), "org.kde.plasmashell", "/PlasmaShell", "org.kde.PlasmaShell.evaluateScript", script])
+    if res is None or res.returncode != 0:
+        say(_('Layout konnte nicht gesetzt werden (läuft plasmashell?) – Details im Log'))
+        return False
+    say(_('Panel-Layout gesetzt'))
+    return True
+
+
+# --------------------------------------------------------------------------
+# Terminal: greeting, prompt, aliases
+# --------------------------------------------------------------------------
+
+BASHRC_D = os.path.join(HOME, ".bashrc.d")
+BASH_SNIPPET = os.path.join(BASHRC_D, "animestage.sh")
+MOTD_OFF = os.path.join(XDG_CONFIG, "no-show-user-motd")
+MOTD_MARK = os.path.join(STATE_DIR, "motd-disabled-by-animestage")
+FASTFETCH_CFG = os.path.join(CONFIG_DIR, "fastfetch.jsonc")
+STARSHIP_CFG = os.path.join(CONFIG_DIR, "starship.toml")
+TERM_CACHE = os.path.join(XDG_CACHE, "animestage", "term")
+TERMINAL_TOOLS = ["starship", "eza", "bat", "zoxide"]
+KITTY_DIR = os.path.join(HOME, ".local", "kitty.app")
+KITTY_CONF_DIR = os.path.join(XDG_CONFIG, "kitty")
+KITTY_THEME = os.path.join(KITTY_CONF_DIR, "animestage.conf")
+
+BASH_SNIPPET_TEXT = """# AnimeStage terminal – generated by `animestage terminal on`, remove with `animestage terminal off`
+[[ $- == *i* ]] || return 0
+
+# Greeting: image + system info, once per window (not in subshells)
+if [[ -z "$ANIMESTAGE_GREETED" && -z "$SSH_CONNECTION" ]] && command -v animestage >/dev/null; then
+    export ANIMESTAGE_GREETED=1
+    animestage greet 2>/dev/null
+fi
+
+# Prompt
+if command -v starship >/dev/null; then
+    export STARSHIP_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/animestage/starship.toml"
+    eval "$(starship init bash)"
+fi
+
+# Extras, only if the programs are installed
+command -v zoxide >/dev/null && eval "$(zoxide init bash)"
+if command -v eza >/dev/null; then
+    alias ls='eza --icons=auto --group-directories-first'
+    alias ll='eza -l --icons=auto --git --group-directories-first'
+    alias la='eza -la --icons=auto --git --group-directories-first'
+    alias tree='eza --tree --icons=auto'
+fi
+command -v bat >/dev/null && alias cath='bat --style=plain --paging=never'
+alias voca='animestage'
+alias wall='animestage wall'
+"""
+
+
+def term_colors(cfg):
+    """Terminal colors: follow the character, single values can be overridden in the Control Center."""
+    p = palette(cfg)
+    t = cfg.get("terminal") or {}
+    out = {
+        "bg": p["bg"], "fg": p["text"], "muted": p["muted"],
+        "prompt": p["accent"], "prompt2": p["accent2"], "cursor": p["accent"],
+    }
+    for key in ("bg", "fg", "prompt", "prompt2", "cursor"):
+        val = t.get(key) or ""
+        if HEX_RE.match(str(val)):
+            out[key] = rgb2hex(hex2rgb(val))
+    ansi = [
+        mix(out["bg"], "#FFFFFF", 0.12),     # 0 black
+        p["negative"],                       # 1 red
+        p["positive"],                       # 2 green
+        p["neutral"],                        # 3 yellow
+        out["prompt"],                       # 4 blue → accent
+        out["prompt2"],                      # 5 magenta → second accent
+        mix(out["prompt"], "#7FDCE6", 0.55), # 6 cyan → light accent
+        mix(out["fg"], out["muted"], 0.25),  # 7 white
+    ]
+    bright = [lighten(c, 0.45 if i == 0 else 0.25) for i, c in enumerate(ansi)]
+    out["ansi"] = ansi + bright
+    return out
+
+
+def apply_konsole(cfg):
+    c = term_colors(cfg)
+    term = cfg.get("terminal") or {}
+    lines = []
+
+    def entry(name, col):
+        lines.extend([f"[{name}]", f"Color={csv(col)}", ""])
+
+    entry("Background", c["bg"])
+    entry("BackgroundFaint", c["bg"])
+    entry("BackgroundIntense", darken(c["bg"], 0.2))
+    entry("Foreground", c["fg"])
+    entry("ForegroundFaint", c["muted"])
+    entry("ForegroundIntense", lighten(c["fg"], 0.4))
+    for i in range(8):
+        entry(f"Color{i}", c["ansi"][i])
+        entry(f"Color{i}Faint", mix(c["ansi"][i], c["bg"], 0.4))
+        entry(f"Color{i}Intense", c["ansi"][i + 8])
+    opacity = float(term.get("opacity", 0.97))
+    wall = terminal_bg_image(cfg)
+    lines += ["[General]", f"Description={THEME_NAME}", f"Opacity={opacity:.2f}",
+              f"Blur={'true' if opacity < 1 else 'false'}", f"Wallpaper={wall}", ""]
+    write_atomic(os.path.join(XDG_DATA, "konsole", f"{THEME_NAME}.colorscheme"), "\n".join(lines))
+    font = term.get("font") or terminal_font()
+    size = int(term.get("fontSize", 11))
+    write_atomic(os.path.join(XDG_DATA, "konsole", f"{THEME_NAME}.profile"), "\n".join([
+        "[Appearance]", f"ColorScheme={THEME_NAME}", f"Font={font},{size},-1,5,400,0,0,0,0,0,0,0,0,0,0,1",
+        "UseFontLineChararacters=true", "BoldIntense=true", "",
+        "[Cursor Options]", "CursorShape=1", "UseCustomCursorColor=true", f"CustomCursorColor={csv(c['cursor'])}", "",
+        "[General]", f"Name={THEME_NAME}", "Parent=FALLBACK/", "TerminalMargin=14", "TerminalCenter=true", "",
+        "[Scrolling]", "ScrollBarPosition=2", "HistorySize=10000", "",
+    ]))
+    run(["kwriteconfig6", "--file", "konsolerc", "--group", "Desktop Entry", "--key", "DefaultProfile", f"{THEME_NAME}.profile"])
+    write_kitty_conf(cfg)
+    write_terminal_files(cfg)
+    say(_('Terminal-Farben gesetzt (Konsole + kitty)'))
+
+
+def terminal_bg_image(cfg):
+    """Own terminal image or the current wallpaper (safe only), heavily darkened and blurred as
+    terminal background – text stays readable. Empty when disabled."""
+    t = cfg.get("terminal") or {}
+    if not t.get("bgImage", True):
+        return ""
+    src = themed_current(cfg, "terminal")
+    if not src:
+        return ""
+    dest = os.path.join(TERM_CACHE, "terminal-bg.png")
+    try:
+        strength = float(t.get("bgDim", 0.86))
+        return darkened(src, dest, term_colors(cfg)["bg"], strength, (1920, 1200), blur=2)
+    except Exception as exc:
+        log(f"terminal-hintergrund: {exc}")
+        return ""
+
+
+def write_kitty_conf(cfg):
+    """kitty theme in its own file; kitty.conf only includes it (your own
+    settings there are kept). Running kitty windows reload."""
+    c = term_colors(cfg)
+    term = cfg.get("terminal") or {}
+    font = term.get("font") or terminal_font()
+    opacity = float(term.get("opacity", 0.97))
+    lines = [
+        "# AnimeStage – regenerated by `animestage apply konsole`, do not edit by hand",
+        f"font_family {font}", f"font_size {int(term.get('fontSize', 11)) + 1}",
+        f"background {c['bg']}", f"foreground {c['fg']}",
+        f"cursor {c['cursor']}", f"cursor_text_color {c['bg']}", "cursor_shape beam", "cursor_blink_interval 0.6",
+        f"selection_background {c['prompt']}", f"selection_foreground {c['bg']}",
+        f"url_color {c['prompt']}", "url_style curly",
+        f"background_opacity {opacity:.2f}", "dynamic_background_opacity yes",
+        "window_padding_width 12 16", "hide_window_decorations no", "confirm_os_window_close 0",
+        "enable_audio_bell no", "visual_bell_duration 0",
+        "tab_bar_edge top", "tab_bar_style powerline", "tab_powerline_style round", "tab_bar_min_tabs 2",
+        f"active_tab_background {c['prompt']}", f"active_tab_foreground {c['bg']}",
+        f"inactive_tab_background {mix(c['bg'], '#FFFFFF', 0.08)}", f"inactive_tab_foreground {c['muted']}",
+        f"tab_bar_background {c['bg']}",
+        f"active_border_color {c['prompt']}", f"inactive_border_color {mix(c['bg'], '#FFFFFF', 0.15)}",
+    ]
+    lines += [f"color{i} {col}" for i, col in enumerate(c["ansi"])]
+    wall = terminal_bg_image(cfg)
+    if wall:
+        lines += [f"background_image {wall}", "background_image_layout cscaled", "background_tint 0"]
+    else:
+        lines += ["background_image none"]
+    write_atomic(KITTY_THEME, "\n".join(lines) + "\n")
+    main = os.path.join(KITTY_CONF_DIR, "kitty.conf")
+    include = "include animestage.conf"
+    text = open(main, encoding="utf-8").read() if os.path.exists(main) else ""
+    if include not in text:
+        write_atomic(main, text + ("\n" if text and not text.endswith("\n") else "") + include + "\n")
+    # open kitty windows pick up the colors immediately
+    if shutil.which("kitty") or os.path.exists(os.path.join(KITTY_DIR, "bin", "kitty")):
+        subprocess.run(["pkill", "-USR1", "-x", "kitty"], capture_output=True)
+
+
+def ansi_fg(col):
+    r, g, b = hex2rgb(col)
+    return f"38;2;{r};{g};{b}"
+
+
+def write_terminal_files(cfg):
+    """fastfetch and Starship config in the terminal colors."""
+    c = term_colors(cfg)
+    an = cfg.get("anime") or {}
+    acc, acc2, mut = ansi_fg(c["prompt"]), ansi_fg(c["prompt2"]), ansi_fg(c["muted"])
+    esc = "\u001b["
+
+    def clip(text, width):
+        """Truncate to display width (Japanese characters are double width)."""
+        import unicodedata
+        out, used = "", 0
+        for ch in text or "":
+            w = 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+            if used + w > width:
+                return out.rstrip() + "…"
+            out, used = out + ch, used + w
+        return out
+    head = clip(an.get("native") or an.get("title") or "AnimeStage", 18)
+    sub = clip(an.get("title") or "", max(0, 34 - min(18, len(head) * 2) - 5)) if an.get("native") else ""
+    ff = {
+        "$schema": "https://github.com/fastfetch-cli/fastfetch/raw/dev/doc/json_schema.json",
+        "logo": {"padding": {"top": 0, "left": 1, "right": 3}},
+        "display": {"separator": "  ", "color": {"keys": acc, "title": acc2}, "key": {"width": 11}},
+        "modules": [
+            "break",
+            {"type": "custom", "format": f"{esc}1;{acc}m{head}{esc}0m  {esc}{mut}m·  {sub}{esc}0m"},
+            {"type": "custom", "format": f"{esc}{acc2}m{'─' * 34}{esc}0m"},
+            {"type": "os", "key": "♪ OS", "format": "{pretty-name}"},
+            {"type": "kernel", "key": "♪ Kernel", "format": "{release}"},
+            {"type": "uptime", "key": "♪ Uptime"},
+            {"type": "de", "key": "♪ Desktop", "format": "{pretty-name} {version}"},
+            {"type": "cpu", "key": "♪ CPU", "format": "{name}"},
+            {"type": "gpu", "key": "♪ GPU", "format": "{name}"},
+            {"type": "memory", "key": "♪ RAM"},
+            {"type": "disk", "key": "♪ Disk", "folders": os.path.realpath(HOME)},
+            {"type": "media", "key": "♫ " + _("Musik"), "format": "{artist} – {title}"},
+            "break",
+            {"type": "colors", "symbol": "circle", "paddingLeft": 2},
+        ],
+    }
+    write_atomic(FASTFETCH_CFG, json.dumps(ff, indent=2, ensure_ascii=False) + "\n")
+
+    emblem = "✦"
+    p = palette(cfg)
+    a, a2, mu, tx, ne, bad = c["prompt"], c["prompt2"], c["muted"], c["fg"], p["neutral"], p["negative"]
+    star = "\n".join([
+        f"# AnimeStage-Prompt ({an.get('title') or '-'}) – wird von `animestage apply konsole` neu erzeugt",
+        "add_newline = true",
+        'format = """',
+        f"[╭─ {emblem} ](bold {a})$username[@](fg:{mu})$hostname $directory$git_branch$git_status$python$nodejs$rust$cmd_duration",
+        f'[╰─](bold {a})$character"""',
+        "",
+        "[username]", "show_always = true", f'style_user = "bold {a}"', 'format = "[$user]($style)"', "",
+        "[hostname]", "ssh_only = false", f'style = "{a2}"', 'format = "[$hostname]($style)"', "",
+        "[directory]", f'style = "bold {tx}"', 'read_only = " 󰌾"', "truncation_length = 4",
+        'truncation_symbol = "…/"', 'format = "[ $path]($style)[$read_only]($read_only_style) "', "",
+        "[git_branch]", 'symbol = " "', f'style = "{a2}"', 'format = "[$symbol$branch]($style) "', "",
+        "[git_status]", f'style = "{ne}"', "",
+        "[cmd_duration]", "min_time = 2000", f'style = "{mu}"', 'format = "[⏱ $duration]($style) "', "",
+        "[character]", f'success_symbol = "[♪](bold {a})"', f'error_symbol = "[♪](bold {bad})"', "",
+        "[python]", f'style = "{mu}"', "[nodejs]", f'style = "{mu}"', "[rust]", f'style = "{mu}"', "",
+    ])
+    write_atomic(STARSHIP_CFG, star)
+
+
+# ---- Greeting image
+
+TERM_KC = os.path.join(DATA_DIR, "term-konachan")
+
+
+def term_wall_cfg(cfg):
+    """Settings for terminal images: own characters/filters from the
+    Control Center, otherwise like the wallpaper – but always safe only, without mood."""
+    t = cfg.get("terminal") or {}
+    w = dict(wall_cfg(cfg), source="konachan", mood="")
+    if w["filter"] in ("ecchi", "nsfw"):
+        w["filter"] = "safe"
+    if t.get("filter") in ("strict", "safe"):
+        w["filter"] = t["filter"]
+    if t.get("chars"):
+        w["chars"] = t["chars"]
+    return dict(cfg, wallswitch=w)
+
+
+def term_fetch_now(cfg, timeout=12):
+    """Fetch a fresh Konachan image of the anime (downscaled version, quick)."""
+    import random
+    a = cfg.get("anime") or {}
+    if not a.get("wallTag"):
+        return ""
+    src = wall_src(cfg)
+    tcfg = term_wall_cfg(cfg)
+    w = wall_cfg(tcfg)
+    os.makedirs(TERM_KC, exist_ok=True)
+    have = {os.path.splitext(n)[0] for n in os.listdir(TERM_KC)}
+    banned = set(map(str, wall_state()["banned"]))
+    char = random.choice(wall_chars(tcfg))
+    base = a["wallTag"] if char == "all" else char
+    path = ""
+    try:
+        for post in src.search([base], rating="s", limit=100, random=True, timeout=timeout):
+            name = f"{src.prefix}-{post['id']}"
+            if name in have or not post_ok(tcfg, post, dict(w, minWidth=1000), banned, char, ("s",)):
+                continue
+            raw = sources.download(post["sample"] or post["large"], timeout)
+            path = os.path.join(TERM_KC, f"{name}.jpg")
+            write_atomic(path, raw, binary=True)
+            meta = load_json(os.path.join(TERM_KC, "meta.json"), {})
+            meta[path] = {"anime": a.get("id"), "char": char}
+            write_atomic(os.path.join(TERM_KC, "meta.json"), json.dumps(meta))
+            break
+    except Exception as exc:
+        log(f"terminal-bild {src.name}: {exc}")
+    # keep only the last 12 greeting images
+    files = sorted((os.path.join(TERM_KC, n) for n in os.listdir(TERM_KC) if n.endswith(".jpg")), key=os.path.getmtime)
+    for old in files[:max(0, len(files) - 12)]:
+        if old != path:
+            os.remove(old)
+    return path
+
+
+def term_fetch_now_bg(cfg):
+    """term_fetch_now in its own process: the terminal waits at most 3.5 s,
+    a slow download finishes in the background afterwards (for the next window)."""
+    stamp = os.path.join(TERM_CACHE, "fresh")
+    os.makedirs(TERM_CACHE, exist_ok=True)
+    if os.path.exists(stamp):
+        os.remove(stamp)
+    proc = subprocess.Popen([os.path.join(HOME, ".local", "bin", "animestage"), "term-fetch", stamp],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    try:
+        proc.wait(3.5)
+    except subprocess.TimeoutExpired:
+        return ""
+    return open(stamp).read().strip() if os.path.exists(stamp) else ""
+
+
+def term_image_pool(cfg):
+    """Images for the greeting, depending on the source chosen in the Control Center."""
+    t = cfg.get("terminal") or {}
+    src = t.get("imageSource", "konachan")
+    if src == "figur":
+        return [it["path"] for it in list_images(cfg) if it["source"] in ("freisteller", "figur")]
+    if src == "konachan":
+        aid = (cfg.get("anime") or {}).get("id")
+        meta = load_json(os.path.join(TERM_KC, "meta.json"), {})
+        own = [os.path.join(TERM_KC, n) for n in os.listdir(TERM_KC) if n.endswith(".jpg")] if os.path.isdir(TERM_KC) else []
+        own = [p for p in own if meta.get(p, {}).get("anime") == aid]
+        return own + [p for p in wall_pool(term_wall_cfg(cfg)) if is_safe(p)]
+    if src == "favoriten":
+        fav = favorites_dir()
+        return [os.path.join(fav, n) for n in os.listdir(fav)
+                if n.lower().endswith(IMAGE_EXT) and is_safe(os.path.join(fav, n))] if os.path.isdir(fav) else []
+    if src == "ordner":
+        folder = os.path.expanduser(t.get("folder") or "")
+        if os.path.isdir(folder):
+            return [os.path.join(folder, n) for n in sorted(os.listdir(folder)) if n.lower().endswith(IMAGE_EXT)]
+    return []
+
+
+def pick_term_image(cfg, prefer=""):
+    """Pick an image never shown in the terminal yet (otherwise the one
+    not shown for the longest time). `prefer` = image that was just downloaded."""
+    import random
+    pool = [p for p in term_image_pool(cfg) if os.path.isfile(p)]
+    hist_file = os.path.join(TERM_CACHE, "shown.json")
+    shown = load_json(hist_file, [])
+    if prefer and os.path.isfile(prefer):
+        choice = prefer
+    elif not pool:
+        return image_or_default(cfg, "launcher") or ""
+    else:
+        fresh = [p for p in pool if p not in shown]
+        if fresh:
+            fresh.sort(key=os.path.getmtime, reverse=True)
+            choice = fresh[0] if (cfg.get("terminal") or {}).get("imageSource", "konachan") == "konachan" else random.choice(fresh)
+        else:
+            order = {p: i for i, p in enumerate(shown)}
+            choice = min(pool, key=lambda p: order.get(p, -1))
+    shown = [p for p in shown if p != choice] + [choice]
+    os.makedirs(TERM_CACHE, exist_ok=True)
+    write_atomic(hist_file, json.dumps(shown[-500:]))
+    return choice
+
+
+def term_image_png(path, rows):
+    """Image downscaled to fit, as PNG (for the kitty graphics protocol)."""
+    from PIL import Image
+    os.makedirs(TERM_CACHE, exist_ok=True)
+    key = re.sub(r"[^A-Za-z0-9]+", "_", path)[-120:] + f"_{rows}_v2.png"
+    out = os.path.join(TERM_CACHE, key)
+    if not (os.path.exists(out) and os.path.getmtime(out) >= os.path.getmtime(path)):
+        im = Image.open(path)
+        im = im.convert("RGBA") if im.mode in ("RGBA", "LA", "P") else im.convert("RGB")
+        if im.mode == "RGBA":
+            box = im.getchannel("A").point(lambda v: 255 if v > 24 else 0).getbbox()
+            if box:
+                im = im.crop(box)
+        # only as large as needed (~20 px per row) and 256 colors – keeps the
+        # transfer small (< 150 KB), some terminals drop large images
+        im.thumbnail((rows * 20 * 3, rows * 20))
+        if im.mode == "RGBA":
+            im = im.quantize(256, method=Image.Quantize.FASTOCTREE, dither=Image.Dither.FLOYDSTEINBERG)
+        else:
+            im = im.quantize(256, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.FLOYDSTEINBERG)
+        im.save(out, optimize=True)
+    with Image.open(out) as im:
+        return out, im.width, im.height
+
+
+def kitty_image_escape(png, cols, rows):
+    import base64
+    data = base64.standard_b64encode(open(png, "rb").read()).decode()
+    chunks = [data[i:i + 4096] for i in range(0, len(data), 4096)] or [""]
+    out = []
+    for i, chunk in enumerate(chunks):
+        more = 1 if i < len(chunks) - 1 else 0
+        if i == 0:
+            # q=2: no reply from the terminal (otherwise text lands in the input), C=1: cursor stays put
+            out.append(f"\x1b_Ga=T,f=100,t=d,q=2,C=1,c={cols},r={rows},m={more};{chunk}\x1b\\")
+        else:
+            out.append(f"\x1b_Gm={more};{chunk}\x1b\\")
+    return "".join(out)
+
+
+def iterm_image_escape(png, cols, rows):
+    """iTerm2 image protocol – understood by e.g. the VS Code terminal (with enableImages)."""
+    import base64
+    raw = open(png, "rb").read()
+    data = base64.standard_b64encode(raw).decode()
+    return f"\x1b]1337;File=inline=1;size={len(raw)};width={cols};height={rows};preserveAspectRatio=0:{data}\x07"
+
+
+def halfblock_art(path, rows, max_cols):
+    """Image as truecolor block graphics (▀) for terminals without an image protocol."""
+    from PIL import Image
+    im = Image.open(path).convert("RGBA")
+    box = im.getchannel("A").point(lambda v: 255 if v > 24 else 0).getbbox()
+    if box:
+        im = im.crop(box)
+    h = rows * 2
+    w = max(1, min(max_cols, round(im.width * h / im.height)))
+    im = im.resize((w, h), Image.LANCZOS)
+    px = im.load()
+    lines = []
+    for y in range(0, h, 2):
+        line = ""
+        for x in range(w):
+            top, bot = px[x, y], px[x, y + 1]
+            t_on, b_on = top[3] > 110, bot[3] > 110
+            if t_on and b_on:
+                line += f"\x1b[38;2;{top[0]};{top[1]};{top[2]};48;2;{bot[0]};{bot[1]};{bot[2]}m▀"
+            elif t_on:
+                line += f"\x1b[49;38;2;{top[0]};{top[1]};{top[2]}m▀"
+            elif b_on:
+                line += f"\x1b[49;38;2;{bot[0]};{bot[1]};{bot[2]}m▄"
+            else:
+                line += "\x1b[0m "
+        lines.append(line + "\x1b[0m")
+    return "\n".join(lines), w
+
+
+def greet(cfg):
+    """fastfetch with a changing image. Konsole and kitty show real images
+    (kitty graphics protocol), other terminals block graphics."""
+    write_terminal_files(cfg)
+    term = cfg.get("terminal") or {}
+    tb = themed_cfg(cfg, "terminal")
+    if tb["everyStart"] and tb["source"] in THEMED_FETCHING:
+        spawn_bg(["themed-rotate", "terminal"])     # background for the next window
+    ff = "/usr/bin/fastfetch" if os.path.exists("/usr/bin/fastfetch") else shutil.which("fastfetch")
+    if not ff:
+        return
+    cmd = [ff, "-c", FASTFETCH_CFG]
+    mode = term.get("image", "auto")
+    img = ""
+    if mode != "none":
+        fresh = ""
+        if term.get("imageSource", "konachan") == "konachan" and term.get("fetchOnOpen", True):
+            fresh = term_fetch_now_bg(cfg)
+        img = pick_term_image(cfg, fresh)
+    if not img:
+        os.execv(ff, cmd + ["--logo", "none"])
+    rows = int(term.get("imageRows", 16))
+    width = shutil.get_terminal_size((110, 30)).columns
+    vscode = os.environ.get("TERM_PROGRAM") == "vscode"
+    graphics = not vscode and bool(os.environ.get("KONSOLE_VERSION") or os.environ.get("KITTY_WINDOW_ID")
+                                   or os.environ.get("TERM") == "xterm-kitty"
+                                   or os.environ.get("TERM_PROGRAM") in ("WezTerm", "ghostty"))
+    if vscode and not apps_cfg(cfg)["vscode"]:
+        vscode = False                      # without the AnimeStage setting VS Code can't show images
+    try:
+        png, pw, ph = term_image_png(img, rows)
+        cols = max(6, round(rows * 2.1 * pw / ph))
+        max_cols = max(10, width - 62)          # leave room for the system info
+        if cols > max_cols:
+            rows = max(6, round(rows * max_cols / cols))
+            cols = max_cols
+        if (graphics or vscode) and mode in ("auto", "kitty"):
+            # First fastfetch with a blank placeholder, then move back up and
+            # draw the image into it – that way the column width is guaranteed to match.
+            spaces = "\n".join([" " * cols] * rows)
+            res = subprocess.run(cmd + ["--pipe", "false", "--logo", spaces, "--logo-type", "data-raw",
+                                        "--logo-width", str(cols), "--logo-height", str(rows)],
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                 env=dict(os.environ, COLUMNS=str(width)))
+            out = res.stdout
+            lines = out.count(b"\n")
+            sys.stdout.flush()
+            os.write(1, out)
+            if lines:
+                if vscode:
+                    # save cursor, insert image at the top, restore cursor (VS Code positions it differently after the image)
+                    seq = f"\x1b7\x1b[{lines}A\r\x1b[1C" + iterm_image_escape(png, cols, rows) + "\x1b8"
+                else:
+                    seq = f"\x1b[{lines}A\r\x1b[1C" + kitty_image_escape(png, cols, rows) + f"\r\x1b[{lines}B"
+                os.write(1, seq.encode())
+            return
+        placeholder, cols = halfblock_art(img, rows, max_cols)
+        cmd += ["--logo", placeholder, "--logo-type", "data-raw",
+                "--logo-width", str(cols), "--logo-height", str(rows)]
+    except Exception as exc:
+        log(f"greet: {exc}")
+        cmd += ["--logo", "none"]
+    os.execv(ff, cmd)
+
+
+# ---- Installation
+
+def install_kitty():
+    """kitty (modern GPU terminal with images) without root into ~/.local."""
+    import tarfile as _tar
+    import io
+    rel = http_json("https://api.github.com/repos/kovidgoyal/kitty/releases/latest")
+    asset = next(a for a in rel["assets"] if a["name"].endswith("-x86_64.txz"))
+    say(_("Lade kitty {version} …", version=rel['tag_name']))
+    raw = http_get(asset["browser_download_url"], 300)
+    tmp = KITTY_DIR + ".new"
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(tmp)
+    with _tar.open(fileobj=io.BytesIO(raw), mode="r:xz") as tf:
+        tf.extractall(tmp, filter="data")
+    shutil.rmtree(KITTY_DIR, ignore_errors=True)
+    os.replace(tmp, KITTY_DIR)
+    bindir = os.path.join(HOME, ".local", "bin")
+    os.makedirs(bindir, exist_ok=True)
+    for name in ("kitty", "kitten"):
+        link = os.path.join(bindir, name)
+        if os.path.islink(link) or os.path.exists(link):
+            os.remove(link)
+        os.symlink(os.path.join(KITTY_DIR, "bin", name), link)
+    apps = os.path.join(XDG_DATA, "applications")
+    icon = os.path.join(KITTY_DIR, "share", "icons", "hicolor", "256x256", "apps", "kitty.png")
+    for desk in ("kitty.desktop", "kitty-open.desktop"):
+        src = os.path.join(KITTY_DIR, "share", "applications", desk)
+        if os.path.exists(src):
+            text = open(src, encoding="utf-8").read()
+            text = re.sub(r"^Icon=kitty$", f"Icon={icon}", text, flags=re.M)
+            text = re.sub(r"^(Try)?Exec=kitty", lambda m: f"{m.group(1) or ''}Exec={os.path.join(KITTY_DIR, 'bin', 'kitty')}", text, flags=re.M)
+            write_atomic(os.path.join(apps, desk), text)
+    fix_kitty_desktop()
+    run(["update-desktop-database", apps])
+    run(["kbuildsycoca6"])
+    say(_("kitty {version} installiert", version=rel['tag_name']))
+
+
+def set_default_terminal(name):
+    """KDE's default terminal (Dolphin "Open Terminal Here", Ctrl+Alt+T, panel)."""
+    desk = {"kitty": "kitty.desktop", "konsole": "org.kde.konsole.desktop"}[name]
+    run(["kwriteconfig6", "--file", "kdeglobals", "--group", "General", "--key", "TerminalApplication", name])
+    run(["kwriteconfig6", "--file", "kdeglobals", "--group", "General", "--key", "TerminalService", desk])
+    # replace the panel launcher
+    other = "applications:org.kde.konsole.desktop" if name == "kitty" else "applications:kitty.desktop"
+    script = """
+var ps = panels();
+for (var i = 0; i < ps.length; ++i) {
+    var ws = ps[i].widgets();
+    for (var j = 0; j < ws.length; ++j) {
+        var w = ws[j];
+        if (w.type !== "org.kde.plasma.icontasks" && w.type !== "org.kde.plasma.taskmanager") continue;
+        w.currentConfigGroup = ["General"];
+        var l = String(w.readConfig("launchers", "")).split(",");
+        for (var k = 0; k < l.length; ++k) { if (l[k] === %s) l[k] = %s; }
+        w.writeConfig("launchers", l);
+    }
+}
+""" % (json.dumps(other), json.dumps("applications:" + desk))
+    run([qdbus(), "org.kde.plasmashell", "/PlasmaShell", "org.kde.PlasmaShell.evaluateScript", script])
+    say(_('Standard-Terminal: {name}', name=name))
+
+
+def terminal_on(cfg, install_tools=False):
+    os.makedirs(BASHRC_D, exist_ok=True)
+    write_atomic(BASH_SNIPPET, BASH_SNIPPET_TEXT)
+    write_terminal_files(cfg)
+    if not os.path.exists(MOTD_OFF):
+        os.makedirs(os.path.dirname(MOTD_OFF), exist_ok=True)
+        open(MOTD_OFF, "w").close()
+        os.makedirs(STATE_DIR, exist_ok=True)
+        open(MOTD_MARK, "w").close()
+    say(_('Terminal: Begrüßung, Prompt und Aliase aktiv (neues Fenster öffnen)'))
+    if install_tools:
+        brew = shutil.which("brew") or "/home/linuxbrew/.linuxbrew/bin/brew"
+        missing = [t for t in TERMINAL_TOOLS if not shutil.which(t)
+                   and not os.path.exists(f"/home/linuxbrew/.linuxbrew/bin/{t}")]
+        if missing and os.path.exists(brew):
+            say(_('Installiere per Homebrew: {missing}', missing=' '.join(missing)))
+            subprocess.run([brew, "install", *missing])
+        if not os.path.exists(os.path.join(KITTY_DIR, "bin", "kitty")):
+            install_kitty()
+        write_kitty_conf(cfg)
+        set_default_terminal("kitty")
+
+
+def terminal_off():
+    if os.path.exists(BASH_SNIPPET):
+        os.remove(BASH_SNIPPET)
+    main = os.path.join(KITTY_CONF_DIR, "kitty.conf")
+    if os.path.exists(main):
+        text = open(main, encoding="utf-8").read()
+        new = "\n".join(l for l in text.split("\n") if l.strip() != "include animestage.conf")
+        if new != text:
+            write_atomic(main, new)
+    if os.path.exists(KITTY_THEME):
+        os.remove(KITTY_THEME)
+    if os.path.exists(MOTD_MARK):
+        os.remove(MOTD_MARK)
+        if os.path.exists(MOTD_OFF):
+            os.remove(MOTD_OFF)
+    say(_('Terminal-Paket entfernt (Standard-Begrüßung wieder an)'))
+
+
+# --------------------------------------------------------------------------
+# Rotating wallpapers from Konachan
+# --------------------------------------------------------------------------
+
+# Safety rules – apply to every image source (the sources themselves: lib/animestage_sources.py).
+# SFW: all characters of the anime. Ecchi/NSFW: only characters that are adult according
+# to AniList or that you marked as adult yourself – and only if no other
+# (younger) character is in the image.
+# For non-"safe" images: everything that hints at younger characters is dropped.
+KONACHAN_MINOR = {
+    "loli", "shota", "child", "children", "aged_down", "younger", "toddler", "kid", "chibi",
+    "flat_chest", "petite", "school_uniform", "serafuku", "randoseru", "kindergarten_uniform",
+    "mesugaki", "elementary_school", "minigirl", "gym_uniform",
+}
+# multiple people – who the others are can't be checked
+KONACHAN_CROWD = {"2girls", "3girls", "4girls", "multiple_girls", "group", "1boy", "2boys", "male", "yuri", "yaoi"}
+FILTER_RATINGS = {"strict": ["s"], "safe": ["s"], "ecchi": ["q"], "nsfw": ["q", "e"]}
+# Moods: a matching Konachan tag is added to the search (without hits, search without it)
+MOODS = {
+    "": [],
+    "ruhig": ["scenic", "sky", "clouds", "flowers", "water"],
+    "nacht": ["night", "stars", "moon"],
+    "action": ["weapon", "sword", "gun", "fighting"],
+    "gemuetlich": ["smile", "food", "cat"],
+    "duester": ["dark", "blood_moon", "rain"],
+    "sommer": ["summer", "beach", "sunset"],
+    "winter": ["snow", "winter"],
+}
+WALL_CACHE = os.path.join(DATA_DIR, "wallpapers")
+WALL_STATE = os.path.join(STATE_DIR, "wallswitch.json")
+# always filtered out: AI images, violence
+KONACHAN_ALWAYS = {"ai-created", "ai_generated", "ai-generated", "ai_art", "blood", "gore", "guro"}
+# additionally in "strict" mode: everything revealing that also appears under "safe"
+KONACHAN_STRICT = {
+    "bikini", "swimsuit", "underwear", "panties", "pantsu", "bra", "lingerie", "breasts", "cleavage",
+    "underboob", "sideboob", "nipples", "naked", "nude", "topless", "bottomless", "ass", "see_through",
+    "wet", "skirt_lift", "shirt_lift", "bondage", "bathing", "towel", "spread_legs", "cameltoe", "loli",
+    "shota", "censored", "undressing", "open_shirt", "garter", "pantyhose", "comic", "text",
+}
+
+
+def wall_defaults():
+    return {"enabled": False, "minutes": 120, "source": "mix", "filter": "strict",
+            "chars": [], "keep": 50, "lock": True, "minWidth": 1920, "mood": ""}
+
+
+def wall_cfg(cfg):
+    w = wall_defaults()
+    w.update(cfg.get("wallswitch") or {})
+    return w
+
+
+def favorites_dir():
+    res = run(["xdg-user-dir", "PICTURES"])
+    pics = res.stdout.strip() if res and res.returncode == 0 else ""
+    if not pics or os.path.realpath(pics) == os.path.realpath(HOME):
+        pics = os.path.join(HOME, "Bilder")
+    return os.path.join(pics, "AnimeStage-Favoriten")
+
+
+def wall_state():
+    st = load_json(WALL_STATE, {})
+    st.setdefault("current", "")
+    st.setdefault("history", [])
+    st.setdefault("banned", [])
+    st.setdefault("meta", {})
+    return st
+
+
+def save_wall_state(st):
+    st["history"] = st["history"][-300:]
+    write_atomic(WALL_STATE, json.dumps(st, indent=1, ensure_ascii=False) + "\n")
+
+
+def wall_chars(cfg):
+    """Chosen character tags; empty or "all" = the whole anime (copyright tag)."""
+    tags = {c["tag"] for c in anime_chars(cfg)}
+    chosen = [t for t in wall_cfg(cfg)["chars"] if t in tags]
+    return chosen or ["all"]
+
+
+def adult_tags(cfg):
+    return {c["tag"] for c in anime_chars(cfg) if char_adult(c)}
+
+
+def post_ok(cfg, post, w, banned, char, ratings):
+    """May this image (uniform entry from animestage_sources) be used?
+    char = character tag or "all" (whole anime)."""
+    tags = set(post.get("tags", "").split())
+    rating = post.get("rating")
+    key = post_key(post) if post.get("site") else str(post.get("id"))
+    if rating not in ratings or key in banned:
+        return False
+    blocked = KONACHAN_ALWAYS | (KONACHAN_STRICT if w["filter"] == "strict" else set())
+    all_chars = {c["tag"] for c in anime_chars(cfg)}
+    if char != "all":
+        # single character chosen → she must be alone in the image
+        blocked = blocked | (all_chars - {char}) | KONACHAN_CROWD
+    if rating != "s":
+        adults = adult_tags(cfg)
+        present = tags & all_chars
+        # at least one adult character, no non-adult one, nobody else
+        if not present or not present <= adults:
+            return False
+        blocked = blocked | KONACHAN_MINOR | KONACHAN_CROWD
+    if tags & (blocked | unwanted_tags(cfg)):
+        return False
+    width, height = post.get("width", 0), post.get("height", 0)
+    # revealing images are rarer – accept slightly smaller/less wide ones there
+    min_w, min_ratio = (1280, 1.3) if rating != "s" else (int(w["minWidth"]), 1.5)
+    return bool(width >= min_w and min_ratio <= width / max(height, 1) <= 2.6
+                and post.get("url"))
+
+
+def safety_selftest():
+    """Checks the minor-protection rules. The installer aborts if they are missing
+    or weakened – so a version without them is never installed."""
+    fails = []
+    if char_adult({"age": "15-"}) or char_adult({"age": "17", "markedAdult": True}):
+        fails.append("characters under 18 must never count as adult")
+    if char_lockable({"age": "16"}):
+        fails.append("characters under 18 must not be unlockable")
+    if char_adult({"age": "1000+"}) or not char_adult({"age": "1000+", "markedAdult": True}):
+        fails.append("Fantasy-Alter ab 100 nur per Markierung")
+    if not {"loli", "shota", "child", "school_uniform", "flat_chest", "petite", "chibi"} <= KONACHAN_MINOR:
+        fails.append("block list for childlike depictions incomplete")
+    if not {"2girls", "multiple_girls", "group", "1boy"} <= KONACHAN_CROWD:
+        fails.append("block list for multiple people incomplete")
+    cfg = {"anime": {"id": 1, "characters": [{"tag": "adult_a", "age": "30"}, {"tag": "minor_b", "age": "15-"}]}}
+    w = dict(wall_defaults(), filter="nsfw")
+    base = {"id": "1", "site": "konachan", "rating": "e", "width": 2560, "height": 1440, "url": "x"}
+    for tags, char in (("adult_a loli", "adult_a"), ("adult_a minor_b", "all"), ("adult_a 2girls", "adult_a"),
+                       ("minor_b", "minor_b"), ("unknown_person", "all")):
+        if post_ok(cfg, dict(base, tags=tags), w, set(), char, ("q", "e")):
+            fails.append(f"revealing image not blocked: {tags}")
+    if not post_ok(cfg, dict(base, tags="adult_a"), w, set(), "adult_a", ("q", "e")):
+        fails.append("control: allowed image is wrongly blocked")
+    # Image sources: borderline ratings ("sensitive", "questionable") must never count as safe
+    if sources.Danbooru.RATING_OUT.get("s") == "s" or sources.Danbooru.RATING_OUT.get("q") == "s":
+        fails.append("Danbooru rating sensitive/questionable would count as safe")
+    if any(sources.Gelbooru.RATING_OUT.get(r) == "s" for r in ("sensitive", "questionable", "explicit")):
+        fails.append("Gelbooru rating would be mapped too loosely")
+    if is_safe("/nicht/vorhanden") is not True:
+        fails.append("is_safe arbeitet nicht wie erwartet")
+    return fails
+
+
+def wall_fetch(cfg, count=6, quiet=False):
+    """Download `count` new random images of the chosen anime into the rotation cache."""
+    from PIL import Image
+    import io
+    import random
+    a = cfg.get("anime") or {}
+    src = wall_src(cfg)
+    if not a.get("wallTag"):
+        if not quiet:
+            say(_('Kein Anime gewählt (oder bei {name} kein Tag) – erst im Kontrollzentrum einen Anime suchen', name=src.name))
+        return 0
+    w = wall_cfg(cfg)
+    st = wall_state()
+    banned = set(map(str, st["banned"]))
+    os.makedirs(WALL_CACHE, exist_ok=True)
+    have_ids = {os.path.splitext(n)[0] for n in os.listdir(WALL_CACHE)}
+    adults = adult_tags(cfg)
+    got = 0
+    chars = wall_chars(cfg)
+    mood_tags = MOODS.get(w.get("mood") or "", [])
+    for attempt in range(10):
+        if got >= count:
+            break
+        char = random.choice(chars)
+        lewd = (w["filter"] in ("ecchi", "nsfw") and not src.safe_only
+                and (char in adults or (char == "all" and adults)))
+        ratings = FILTER_RATINGS[w["filter"]] if lewd else ["s"]
+        rating = random.choice(ratings)
+        base = a["wallTag"] if char == "all" else char
+        if rating != "s" and char == "all":
+            base = random.choice(sorted(adults))      # search specifically for the adults
+        mood = random.choice(mood_tags) if mood_tags and attempt < 6 else ""
+        try:
+            posts = src.search([base, mood], rating=rating, limit=100, random=True)
+        except Exception as exc:
+            log(f"{src.name}: {exc}")
+            if not quiet:
+                say(_('{name} nicht erreichbar: {exc} – im Kontrollzentrum (System → Bildquellen) eine andere Quelle wählen', name=src.name, exc=exc))
+            break
+        for post in posts:
+            if got >= count:
+                break
+            pid = post_key(post)
+            name = f"{src.prefix}-{post['id']}"
+            if name in have_ids or not post_ok(cfg, post, w, banned, char, ratings):
+                continue
+            try:
+                raw = sources.download(post["large"] or post["url"], 120)
+                im = Image.open(io.BytesIO(raw))
+                im.load()
+                if im.mode != "RGB":
+                    im = im.convert("RGB")
+                im.thumbnail((3840, 2400))
+                dest = os.path.join(WALL_CACHE, f"{name}.jpg")
+                im.save(dest, quality=90, optimize=True)
+            except Exception as exc:
+                log(f"{src.name} {pid}: {exc}")
+                continue
+            have_ids.add(name)
+            st["meta"][dest] = {"id": pid, "site": src.name, "anime": a.get("id"), "char": char, "mood": mood,
+                                "artist": post["author"] or "?", "source": post["source"],
+                                "page": post["page"], "rating": post["rating"]}
+            got += 1
+            if not quiet:
+                say(f"  ✓ {src.name} #{post['id']} ({char if char != 'all' else a.get('title')})")
+            time.sleep(0.5)
+    # keep the cache small: delete the oldest images (never the current one; favorites live elsewhere)
+    files = sorted((os.path.join(WALL_CACHE, n) for n in os.listdir(WALL_CACHE)), key=os.path.getmtime)
+    for path in files[:max(0, len(files) - int(w["keep"]))]:
+        if path != st["current"]:
+            os.remove(path)
+            st["meta"].pop(path, None)
+    save_wall_state(st)
+    return got
+
+
+def wall_matches(cfg, m):
+    """Does a downloaded image match the current settings (anime, character, filter, mood)?"""
+    a = cfg.get("anime") or {}
+    if m.get("anime") != a.get("id"):
+        return False
+    w = wall_cfg(cfg)
+    chars = set(wall_chars(cfg))
+    if m.get("char") not in chars:
+        return False
+    if (w.get("mood") or "") and m.get("mood") not in MOODS.get(w["mood"], []):
+        return False
+    rating = m.get("rating", "s")
+    if w["filter"] in ("ecchi", "nsfw") and (m.get("char") in adult_tags(cfg) or m.get("char") == "all"):
+        return rating in FILTER_RATINGS[w["filter"]] or (rating == "s" and not adult_tags(cfg))
+    return rating == "s"
+
+
+def wall_pool(cfg):
+    w = wall_cfg(cfg)
+    pool = []
+    meta = wall_state()["meta"]
+    if w["source"] in ("konachan", "mix") and os.path.isdir(WALL_CACHE):
+        for n in os.listdir(WALL_CACHE):
+            path = os.path.join(WALL_CACHE, n)
+            if n.lower().endswith(IMAGE_EXT) and wall_matches(cfg, meta.get(path, {})):
+                pool.append(path)
+    fav = favorites_dir()
+    if w["source"] in ("favorites", "mix") and os.path.isdir(fav):
+        aid = (cfg.get("anime") or {}).get("id")
+        for n in os.listdir(fav):
+            path = os.path.join(fav, n)
+            m = meta.get(path, {})
+            # in mixed mode only favorites of this anime; own images without info always
+            if n.lower().endswith(IMAGE_EXT) and (w["source"] == "favorites" or not m.get("anime") or m.get("anime") == aid):
+                pool.append(path)
+    return pool
+
+
+LOGIN_DIR = "/var/lib/animestage-login"
+LOGIN_SETUP = os.path.join(DATA_DIR, "login-setup.sh")
+
+
+def login_ready():
+    return os.path.isdir(LOGIN_DIR) and os.access(LOGIN_DIR, os.W_OK)
+
+
+def login_outdated():
+    """Older setups only set "Image" – the preview image from the Bazzite defaults
+    then kept winning. Setting it up again (password once) fixes that."""
+    conf = "/etc/plasmalogin.conf.d/90-animestage.conf"
+    try:
+        return login_ready() and "PreviewImage=" not in open(conf, encoding="utf-8").read()
+    except OSError:
+        return False
+
+
+def export_login(path):
+    """Copies the wallpaper for the login screen. A root service
+    (set up once via `animestage login setup`) passes it on to the
+    Plasma Login Manager."""
+    if not login_ready() or not path or not os.path.isfile(path):
+        return False
+    try:
+        from PIL import Image
+        im = Image.open(path)
+        im = im.convert("RGB")
+        im.thumbnail((3840, 2160))
+        tmp = os.path.join(LOGIN_DIR, f".wallpaper.{os.getpid()}.jpg")
+        im.save(tmp, quality=92)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, os.path.join(LOGIN_DIR, "wallpaper.jpg"))
+        return True
+    except Exception as exc:
+        log(f"login-export: {exc}")
+        return False
+
+
+def login_setup(remove=False):
+    if not os.path.exists(LOGIN_SETUP):
+        sys.exit(_('login-setup.sh fehlt – Installer erneut ausführen'))
+    args = ["pkexec", "/bin/bash", LOGIN_SETUP, "remove" if remove else "install", os.environ.get("USER") or os.getlogin()]
+    res = subprocess.run(args)
+    if res.returncode != 0:
+        sys.exit(_('Abgebrochen oder fehlgeschlagen'))
+    if not remove:
+        cfg = load_config()
+        export_login(image_or_default(cfg, "lock"))      # "lock" = safe images only
+        say(_('Anmeldebildschirm zeigt ab jetzt deinen Hintergrund'))
+    else:
+        say(_('Anmeldebildschirm wieder auf Systemstandard'))
+
+
+def is_safe(path):
+    """Revealing images (adult characters only) never end up on the lock/login
+    screen or in the terminal – someone else might see those too."""
+    return wall_state()["meta"].get(path, {}).get("rating", "s") == "s"
+
+
+def set_wallpaper(cfg, path):
+    run(["plasma-apply-wallpaperimage", path])
+    # remember as current first – colors, terminal background and Firefox use the new image
+    st = wall_state()
+    st["current"] = path
+    save_wall_state(st)
+    auto_colors(cfg, path)
+    if not is_safe(path):
+        return
+    export_login(path)
+    if wall_cfg(cfg)["lock"]:
+        base = ["--file", "kscreenlockerrc", "--group", "Greeter", "--group", "Wallpaper",
+                "--group", "org.kde.image", "--group", "General"]
+        for key in ("Image", "PreviewImage"):
+            run(["kwriteconfig6", *base, "--key", key, "file://" + path])
+
+
+def wall_next(cfg, quiet=False):
+    import random
+    w = wall_cfg(cfg)
+    st = wall_state()
+    pool = wall_pool(cfg)
+
+    def unseen(pool):
+        recent = set(st["history"][-max(1, len(pool) * 2 // 3):])
+        return [p for p in pool if p not in recent and p != st["current"]]
+
+    fresh = unseen(pool)
+    # Download new images when hardly anything unseen is left in the cache
+    if w["source"] in ("konachan", "mix") and len([p for p in fresh if p.startswith(WALL_CACHE)]) < 3:
+        if wall_fetch(cfg, 6, quiet=quiet):
+            st = wall_state()
+            pool = wall_pool(cfg)
+            fresh = unseen(pool)
+    others = [p for p in pool if p != st["current"]]
+    if not (fresh or others):
+        # Nothing matching (e.g. few revealing images, rare mood) → search more loosely
+        loose = dict(cfg, wallswitch=dict(w, filter="safe" if w["filter"] in ("ecchi", "nsfw") else w["filter"], mood=""))
+        if not quiet:
+            say(_('Kaum passende Bilder – suche ohne Stimmung bzw. mit „safe“'))
+        pool = wall_pool(loose)
+        if len(pool) < 3:
+            wall_fetch(loose, 6, quiet=quiet)
+            st = wall_state()
+            pool = wall_pool(loose)
+        fresh = unseen(pool)
+        others = [p for p in pool if p != st["current"]]
+    choice = random.choice(fresh or others or pool or [""])
+    if not choice:
+        say(_('Keine passenden Bilder – Anime gewählt? Internet? Sonst andere Figur/Filter wählen'))
+        return False
+    set_wallpaper(cfg, choice)
+    st["current"] = choice
+    st["history"].append(choice)
+    save_wall_state(st)
+    if not quiet:
+        meta = st["meta"].get(choice, {})
+        say(_("Hintergrund: {name} von {artist}", name=os.path.basename(choice), artist=meta["artist"]) if meta.get("artist")
+            else _("Hintergrund: {path}", path=os.path.basename(choice)))
+    return True
+
+
+def wall_fav(cfg):
+    st = wall_state()
+    cur = st["current"]
+    if not cur or not os.path.exists(cur):
+        say(_('Kein aktuelles Wechsel-Bild'))
+        return
+    fav = favorites_dir()
+    os.makedirs(fav, exist_ok=True)
+    if cur.startswith(fav + os.sep):
+        say(_('Ist schon ein Favorit ♥'))
+        return
+    dest = os.path.join(fav, os.path.basename(cur))
+    shutil.copy2(cur, dest)
+    st["meta"][dest] = st["meta"].get(cur, {})
+    st["history"].append(dest)
+    st["current"] = dest
+    save_wall_state(st)
+    say(_('♥ Gespeichert in {fav}', fav=fav))
+
+
+def wall_ban(cfg):
+    st = wall_state()
+    cur = st["current"]
+    meta = st["meta"].get(cur, {})
+    if meta.get("id"):
+        st["banned"].append(meta["id"])
+    if cur.startswith(WALL_CACHE + os.sep) and os.path.exists(cur):
+        os.remove(cur)
+        st["meta"].pop(cur, None)
+    st["current"] = ""
+    save_wall_state(st)
+    say(_('Bild aussortiert – kommt nicht wieder'))
+    return wall_next(cfg)
+
+
+def wall_timer(cfg, on):
+    unit_dir = os.path.join(XDG_CONFIG, "systemd", "user")
+    svc = os.path.join(unit_dir, "animestage-wall.service")
+    tmr = os.path.join(unit_dir, "animestage-wall.timer")
+    w = wall_cfg(cfg)
+    if on:
+        write_atomic(svc, "\n".join([
+            "[Unit]", "Description=AnimeStage: next wallpaper", "",
+            "[Service]", "Type=oneshot",
+            f"ExecStart={os.path.join(HOME, '.local', 'bin', 'animestage')} wall next --quiet", "",
+        ]))
+        write_atomic(tmr, "\n".join([
+            "[Unit]", f"Description=AnimeStage: change wallpaper every {int(w['minutes'])} minutes", "",
+            "[Timer]", "OnActiveSec=2min", f"OnUnitActiveSec={int(w['minutes'])}min", "",
+            "[Install]", "WantedBy=timers.target", "",
+        ]))
+        run(["systemctl", "--user", "daemon-reload"])
+        run(["systemctl", "--user", "enable", "animestage-wall.timer"])
+        run(["systemctl", "--user", "restart", "animestage-wall.timer"])
+        say(_("Hintergrundwechsel an: alle {minutes} Minuten", minutes=int(w['minutes'])))
+    else:
+        run(["systemctl", "--user", "disable", "--now", "animestage-wall.timer"])
+        for path in (svc, tmr):
+            if os.path.exists(path):
+                os.remove(path)
+        run(["systemctl", "--user", "daemon-reload"])
+        say(_('Hintergrundwechsel aus'))
+
+
+def wall_set(cfg, path):
+    """Fixed wallpaper: turns off automatic rotation."""
+    path = os.path.abspath(os.path.expanduser(path.replace("file://", "")))
+    if not os.path.isfile(path):
+        sys.exit(_('Bild nicht gefunden: {path}', path=path))
+    if wall_cfg(cfg)["enabled"]:
+        cfg["wallswitch"] = wall_cfg(cfg)
+        cfg["wallswitch"]["enabled"] = False
+        wall_timer(cfg, False)
+    cfg["images"]["wallpaper"] = path
+    save_config(cfg)
+    set_wallpaper(cfg, path)
+    st = wall_state()
+    st["current"] = path
+    save_wall_state(st)
+    say(_('Hintergrund fest: {path}', path=os.path.basename(path)))
+
+
+def wall_list(cfg):
+    """All wallpapers for the Control Center: favorites, anime banner and freshly downloaded ones (Konachan)."""
+    st = wall_state()
+    out = []
+
+    def add(path, source, artist="", char=""):
+        out.append({"path": path, "thumb": make_thumb(path), "source": source,
+                    "artist": artist or st["meta"].get(path, {}).get("artist", ""), "char": char})
+
+    fav = favorites_dir()
+    if os.path.isdir(fav):
+        for n in sorted(os.listdir(fav)):
+            if n.lower().endswith(IMAGE_EXT):
+                add(os.path.join(fav, n), "fav")
+    a = cfg.get("anime") or {}
+    if a.get("banner"):
+        add(a["banner"], "figur", "AniList-Banner")
+    if os.path.isdir(WALL_CACHE):
+        files = [os.path.join(WALL_CACHE, n) for n in os.listdir(WALL_CACHE) if n.lower().endswith(IMAGE_EXT)]
+        for path in sorted(files, key=os.path.getmtime, reverse=True):
+            add(path, "neu")
+    return out
+
+
+def wall_status(cfg):
+    st = wall_state()
+    fav = favorites_dir()
+    cur = st["current"] if st["current"] and os.path.exists(st["current"]) else ""
+    meta = st["meta"].get(cur, {})
+    cache = os.listdir(WALL_CACHE) if os.path.isdir(WALL_CACHE) else []
+    favs = [n for n in os.listdir(fav) if n.lower().endswith(IMAGE_EXT)] if os.path.isdir(fav) else []
+    return {"settings": wall_cfg(cfg), "current": cur, "thumb": make_thumb(cur) if cur else "",
+            "isFavorite": bool(cur) and cur.startswith(fav + os.sep), "artist": meta.get("artist", ""),
+            "page": meta.get("page", ""), "login": login_ready(), "loginOutdated": login_outdated(), "cached": len(cache), "favorites": len(favs), "favoritesDir": fav}
+
+
+# --------------------------------------------------------------------------
+# Migration from the previous version (VocaStage)
+# --------------------------------------------------------------------------
+
+OLD = "vocastage"
+
+
+def migrate_vocastage():
+    """Adopts settings, backups, favorites and panel widgets from VocaStage
+    and cleans up the old parts. Safe to run multiple times."""
+    old_cfg_file = os.path.join(XDG_CONFIG, OLD, "config.json")
+    old_state = os.path.join(XDG_STATE, OLD)
+    found = False
+
+    # 1. Settings (without the Vocaloid character/images)
+    if os.path.exists(old_cfg_file) and not os.path.exists(CONFIG_FILE):
+        found = True
+        old = load_json(old_cfg_file, {})
+        cfg = default_config()
+        for key in ("style", "clock", "system", "folders"):
+            if key in old:
+                cfg[key] = deep_merge(cfg.get(key, {}), old[key]) if isinstance(old[key], dict) else old[key]
+        t = dict(old.get("terminal") or {})
+        if t.get("imageSource") == "figur":
+            t["imageSource"] = "konachan"
+        t.pop("chars", None)
+        cfg["terminal"] = deep_merge(cfg["terminal"], t)
+        w = dict(old.get("wallswitch") or {})
+        w.update({"chars": [], "minutes": 120, "mood": ""})
+        if w.get("filter") not in ("strict", "safe"):
+            w["filter"] = "strict"
+        cfg["wallswitch"] = deep_merge(wall_defaults(), w)
+        cfg["launcher"] = deep_merge(cfg["launcher"], {k: v for k, v in (old.get("launcher") or {}).items() if k != "icon"})
+        save_config(cfg)
+        say(_('Einstellungen von VocaStage übernommen'))
+
+    # 2. Backups (incl. "original" = state before the very first installation)
+    old_backups = os.path.join(old_state, "backups")
+    if os.path.isdir(old_backups):
+        found = True
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        for name in os.listdir(old_backups):
+            dest = os.path.join(BACKUP_DIR, name)
+            if not os.path.exists(dest):
+                shutil.copytree(os.path.join(old_backups, name), dest)
+        say(_('Backups übernommen (inkl. Originalzustand)'))
+    if os.path.exists(os.path.join(old_state, f"motd-disabled-by-{OLD}")) and not os.path.exists(MOTD_MARK):
+        os.makedirs(STATE_DIR, exist_ok=True)
+        open(MOTD_MARK, "w").close()
+
+    # 3. Favorites
+    old_fav = os.path.join(os.path.dirname(favorites_dir()), "VocaStage-Favoriten")
+    if os.path.isdir(old_fav):
+        found = True
+        new_fav = favorites_dir()
+        os.makedirs(new_fav, exist_ok=True)
+        for n in os.listdir(old_fav):
+            if not os.path.exists(os.path.join(new_fav, n)):
+                shutil.move(os.path.join(old_fav, n), os.path.join(new_fav, n))
+        try:
+            os.rmdir(old_fav)
+        except OSError:
+            pass
+        say(_('Favoriten nach {new_fav} verschoben', new_fav=new_fav))
+
+    # adopt the font and the Papirus marker (saves downloads)
+    old_fonts = os.path.join(XDG_DATA, "fonts", OLD)
+    new_fonts = os.path.join(XDG_DATA, "fonts", "animestage")
+    if os.path.isdir(old_fonts) and not os.path.exists(new_fonts):
+        shutil.move(old_fonts, new_fonts)
+        run(["fc-cache", "-f", new_fonts])
+    for pap in ("Papirus", "Papirus-Dark"):
+        mark = os.path.join(XDG_DATA, "icons", pap, f".{OLD}")
+        if os.path.exists(mark):
+            os.replace(mark, os.path.join(XDG_DATA, "icons", pap, ".animestage"))
+
+    # 4. Terminal leftovers, timer, kitty include
+    for path in (os.path.join(HOME, ".bashrc.d", f"{OLD}.sh"),):
+        if os.path.exists(path):
+            found = True
+            os.remove(path)
+    kitty_main = os.path.join(KITTY_CONF_DIR, "kitty.conf")
+    if os.path.exists(kitty_main):
+        text = open(kitty_main, encoding="utf-8").read()
+        if f"include {OLD}.conf" in text:
+            write_atomic(kitty_main, text.replace(f"include {OLD}.conf\n", "").replace(f"include {OLD}.conf", ""))
+    for path in (os.path.join(KITTY_CONF_DIR, f"{OLD}.conf"),):
+        if os.path.exists(path):
+            os.remove(path)
+    unit_dir = os.path.join(XDG_CONFIG, "systemd", "user")
+    if os.path.exists(os.path.join(unit_dir, f"{OLD}-wall.timer")):
+        found = True
+        run(["systemctl", "--user", "disable", "--now", f"{OLD}-wall.timer"])
+        for ext in ("timer", "service"):
+            p = os.path.join(unit_dir, f"{OLD}-wall.{ext}")
+            if os.path.exists(p):
+                os.remove(p)
+        run(["systemctl", "--user", "daemon-reload"])
+
+    # 5. Panel: replace old widgets with the new ones, order stays the same
+    swapped = migrate_panel()
+    found = found or swapped
+
+    # 6. Old packages and files
+    plasmoids = os.path.join(XDG_DATA, "plasma", "plasmoids")
+    if os.path.isdir(plasmoids):
+        for n in os.listdir(plasmoids):
+            if n.startswith(f"org.{OLD}."):
+                found = True
+                run(["kpackagetool6", "-t", "Plasma/Applet", "-r", n])
+    if os.path.isdir(os.path.join(XDG_DATA, "plasma", "look-and-feel", f"org.{OLD}.desktop")):
+        run(["kpackagetool6", "-t", "Plasma/LookAndFeel", "-r", f"org.{OLD}.desktop"])
+    for p in (os.path.join(HOME, ".local", "bin", OLD),
+              os.path.join(XDG_DATA, "applications", f"org.{OLD}.control.desktop"),
+              os.path.join(XDG_DATA, "applications", f"org.{OLD}.wall-next.desktop"),
+              os.path.join(XDG_DATA, "applications", f"org.{OLD}.wall-fav.desktop"),
+              os.path.join(XDG_DATA, "icons", "hicolor", "scalable", "apps", f"{OLD}.svg"),
+              os.path.join(XDG_DATA, "color-schemes", "VocaStage.colors"),
+              os.path.join(XDG_DATA, "konsole", "VocaStage.colorscheme"),
+              os.path.join(XDG_DATA, "konsole", "VocaStage.profile")):
+        if os.path.exists(p):
+            os.remove(p)
+    for d in (os.path.join(XDG_DATA, "plasma", "desktoptheme", "VocaStage"),
+              os.path.join(XDG_DATA, "aurorae", "themes", "VocaStage"),
+              os.path.join(XDG_CONFIG, "Kvantum", "VocaStage"),
+              os.path.join(XDG_DATA, OLD), os.path.join(XDG_CACHE, OLD)):
+        if os.path.isdir(d):
+            shutil.rmtree(d, ignore_errors=True)
+    if os.path.isdir(os.path.join(XDG_CONFIG, OLD)):
+        shutil.rmtree(os.path.join(XDG_CONFIG, OLD), ignore_errors=True)
+    if os.path.isdir(old_state):
+        shutil.rmtree(old_state, ignore_errors=True)
+    if found:
+        say(_('VocaStage-Reste entfernt'))
+    return found
+
+
+def migrate_panel():
+    """Replaces org.vocastage.* in the panel with org.animestage.* at the same position."""
+    probe = run([qdbus(), "org.kde.plasmashell", "/PlasmaShell", "org.kde.PlasmaShell.evaluateScript", """
+var out = [];
+var ps = panels();
+for (var i = 0; i < ps.length; ++i) {
+    var p = ps[i]; var ws = p.widgets(); var map = {};
+    for (var k = 0; k < ws.length; ++k) {
+        var t = String(ws[k].type);
+        if (t.indexOf("org.vocastage.") === 0) {
+            var n = p.addWidget(t.replace("org.vocastage.", "org.animestage."));
+            if (n) { map[ws[k].id] = n.id; }
+            ws[k].remove();
+        }
+    }
+    var now = p.widgets();
+    for (var t2 = 0; t2 < now.length; ++t2) {
+        if (now[t2].type !== "org.kde.plasma.icontasks" && now[t2].type !== "org.kde.plasma.taskmanager") continue;
+        now[t2].currentConfigGroup = ["General"];
+        var l = String(now[t2].readConfig("launchers", "")).split(",");
+        for (var q = 0; q < l.length; ++q) {
+            if (l[q] === "applications:org.vocastage.control.desktop" || l[q] === "applications:org.kde.plasmawindowed.desktop") l[q] = "applications:org.animestage.control.desktop";
+        }
+        now[t2].writeConfig("launchers", l);
+    }
+    p.currentConfigGroup = ["General"];
+    out.push({ id: p.id, order: String(p.readConfig("AppletOrder", "")), map: map });
+}
+print(JSON.stringify(out));
+"""])
+    if not probe or probe.returncode != 0 or not probe.stdout.strip():
+        return False
+    try:
+        panels = json.loads(probe.stdout.strip())
+    except ValueError:
+        return False
+    if not reorder_panels(panels):
+        return False
+    say(_('Panel-Widgets auf AnimeStage umgestellt (gleiche Reihenfolge)'))
+    return True
+
+
+def reorder_panels(panels):
+    """Put replaced widgets (map: old → new ID) at the old position.
+    The order has to be written while Plasma is stopped."""
+    changed = [p for p in panels if p["map"]]
+    if not changed:
+        return False
+    # write the order while Plasma is stopped (otherwise Plasma overwrites it on exit)
+    run(["kquitapp6", "plasmashell"])
+    for _i in range(40):
+        if subprocess.run(["pgrep", "-x", "plasmashell"], capture_output=True).returncode != 0:
+            break
+        time.sleep(0.25)
+    run(["pkill", "-x", "plasmashell"])
+    for p in changed:
+        order = []
+        for x in p["order"].split(";"):
+            x = str(p["map"].get(x, x))
+            if x and x not in order:
+                order.append(x)
+        if order:
+            run(["kwriteconfig6", "--file", "plasma-org.kde.plasma.desktop-appletsrc", "--group", "Containments",
+                 "--group", str(p["id"]), "--group", "General", "--key", "AppletOrder", ";".join(order)])
+    start_plasmashell()
+    for _i in range(40):
+        if subprocess.run([qdbus(), "org.kde.plasmashell", "/PlasmaShell"], capture_output=True).returncode == 0:
+            break
+        time.sleep(0.5)
+    return True
+
+
+# ---- Taskbar: window titles (like Windows) and grouping
+
+def taskbar_cfg(cfg):
+    t = {"labels": True, "group": False, "width": "narrow"}
+    t.update(cfg.get("taskbar") or {})
+    return t
+
+
+TASK_WIDTH = {"narrow": 0, "medium": 1, "wide": 2}   # Plasma: taskMaxWidth
+
+
+def fix_kitty_desktop():
+    """kitty doesn't report its startup under Wayland. With StartupNotify, Plasma
+    creates a placeholder, and the real window ends up on the far right instead of
+    at the pinned icon. Without startup notification + with a window class it sits right."""
+    path = os.path.join(XDG_DATA, "applications", "kitty.desktop")
+    if not os.path.exists(path):
+        return False
+    text = open(path, encoding="utf-8").read()
+    new = re.sub(r"^StartupNotify=.*$", "StartupNotify=false", text, flags=re.M)
+    if "StartupWMClass=" not in new:
+        new = new.replace("[Desktop Entry]\n", "[Desktop Entry]\nStartupWMClass=kitty\n", 1)
+    if new != text:
+        write_atomic(path, new)
+        run(["kbuildsycoca6"])
+        return True
+    return False
+
+
+def taskbar_type(cfg):
+    # Plasma: "icontasks" = icons only, "taskmanager" = icon + window title
+    return "org.kde.plasma.taskmanager" if taskbar_cfg(cfg)["labels"] else "org.kde.plasma.icontasks"
+
+
+def apply_taskbar(cfg):
+    """Reconfigures the taskbar. Switching icon ↔ title swaps the widget at the same
+    position (pinned apps stay); grouping applies immediately."""
+    t = taskbar_cfg(cfg)
+    script = """
+var want = %s; var group = %d; var width = %d; var out = [];
+var ps = panels();
+for (var i = 0; i < ps.length; ++i) {
+    var p = ps[i]; var ws = p.widgets(); var map = {};
+    for (var k = 0; k < ws.length; ++k) {
+        var w = ws[k]; var t = String(w.type);
+        if (t !== "org.kde.plasma.icontasks" && t !== "org.kde.plasma.taskmanager") continue;
+        var target = w;
+        if (t !== want) {
+            w.currentConfigGroup = ["General"];
+            var l = String(w.readConfig("launchers", "")).split(",").filter(function (x) { return x.length > 0; });
+            target = p.addWidget(want);
+            if (!target) continue;
+            target.currentConfigGroup = ["General"];
+            target.writeConfig("launchers", l);
+            map[w.id] = target.id;
+            w.remove();
+        }
+        target.currentConfigGroup = ["General"];
+        target.writeConfig("groupingStrategy", group);
+        target.writeConfig("groupPopups", group === 1);
+        // windows of a pinned app appear at its position (not appended at the end)
+        target.writeConfig("separateLaunchers", false);
+        if (want === "org.kde.plasma.taskmanager") target.writeConfig("taskMaxWidth", width);
+    }
+    p.currentConfigGroup = ["General"];
+    out.push({ id: p.id, order: String(p.readConfig("AppletOrder", "")), map: map });
+}
+print(JSON.stringify(out));
+""" % (json.dumps(taskbar_type(cfg)), 1 if t["group"] else 0, TASK_WIDTH.get(t["width"], 0))
+    fix_kitty_desktop()
+    res = run([qdbus(), "org.kde.plasmashell", "/PlasmaShell", "org.kde.PlasmaShell.evaluateScript", script])
+    if not res or res.returncode != 0 or not res.stdout.strip():
+        say(_('Taskleiste: Plasma nicht erreichbar – später erneut versuchen'))
+        return
+    try:
+        panels = json.loads(res.stdout.strip())
+    except ValueError:
+        return
+    if reorder_panels(panels):
+        say(_('Taskleiste umgestellt (Plasma wurde kurz neu gestartet)'))
+    say(_("Taskleiste: {mode}, {grouping}", mode=_("Symbol + Fenstername") if t['labels'] else _("nur Symbole"),
+          grouping=_("gleiche Programme zusammengefasst") if t['group'] else _("jedes Fenster einzeln")))
+
+
+# --------------------------------------------------------------------------
+# Apps: Firefox, VS Code (follow the theme colors)
+# --------------------------------------------------------------------------
+
+APP_STATE = os.path.join(STATE_DIR, "apps.json")
+FF_BASES = [
+    os.path.join(HOME, ".var", "app", "org.mozilla.firefox", "config", "mozilla", "firefox"),
+    os.path.join(HOME, ".var", "app", "org.mozilla.firefox", ".mozilla", "firefox"),
+    os.path.join(HOME, ".mozilla", "firefox"),
+]
+FF_PREF = 'user_pref("toolkit.legacyUserProfileCustomizations.stylesheets", true);'
+FF_PREF_MARK = "// AnimeStage: allows userChrome.css (removed again on uninstall)"
+GEN_MARK = "/* AnimeStage – automatisch erzeugt, wird bei jedem Farbwechsel neu geschrieben */"
+VSCODE_SETTINGS = [os.path.join(XDG_CONFIG, d, "User", "settings.json") for d in ("Code", "VSCodium", "Code - OSS")]
+
+
+def apps_cfg(cfg):
+    a = {"firefox": True, "vscode": True}
+    a.update(cfg.get("apps") or {})
+    return a
+
+
+def theme_image(cfg):
+    """Current wallpaper if safe, otherwise the anime's banner/cover."""
+    cur = wall_state()["current"]
+    if cur and os.path.isfile(cur) and is_safe(cur):
+        return cur
+    a = cfg.get("anime") or {}
+    return a.get("banner") or a.get("cover") or ""
+
+
+def darkened(src, dest, bg, amount, size=(1920, 1200), blur=0):
+    """Image downscaled, slightly blurred and darkened with the background color."""
+    from PIL import Image, ImageFilter
+    im = Image.open(src).convert("RGB")
+    im.thumbnail(size)
+    if blur:
+        im = im.filter(ImageFilter.GaussianBlur(blur))
+    im = Image.blend(im, Image.new("RGB", im.size, tuple(hex2rgb(bg))), amount)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    tmp = dest + ".tmp" + os.path.splitext(dest)[1]
+    im.save(tmp, quality=88) if dest.endswith(".jpg") else im.save(tmp, optimize=True)
+    os.replace(tmp, dest)
+    return dest
+
+
+# ---- Own images for terminal background and Firefox
+# Every target has exactly one current image (cur-ID.jpg) and one prepared (next-ID.jpg).
+# When the terminal/Firefox starts, the prepared one is promoted and a new one is
+# downloaded in the background; old images are deleted right away. Always Konachan "safe" only.
+
+THEMED_DIR = os.path.join(DATA_DIR, "themed")
+THEMED_TARGETS = ("terminal", "firefox")
+THEMED_FETCHING = ("anime", "animesuche", "suche")
+
+
+def themed_cfg(cfg, target):
+    if target == "firefox":
+        f = {"source": "anime", "tags": "", "everyStart": True, "dim": 0.35, "ownColors": True}
+        f.update(cfg.get("firefox") or {})
+        return f
+    t = cfg.get("terminal") or {}
+    return {"source": t.get("bgSource", "anime") if t.get("bgImage", True) else "none",
+            "tags": t.get("bgTags", ""), "everyStart": t.get("bgEveryStart", True)}
+
+
+def search_tags(text):
+    """„night sky, scenic“ → ["night_sky", "scenic"] (Komma trennt, Leerzeichen → _)."""
+    tags = []
+    for part in re.split(r"[,;\n]+", text or ""):
+        tag = re.sub(r"\s+", "_", part.strip().lower())
+        if tag and not re.match(r"-?(rating|order|limit|user|fav|vote|score)\:", tag) and tag not in tags:
+            tags.append(tag)
+    return tags[:3]
+
+
+def resolve_tags(src, tags, timeout=15):
+    """Map free input to real tags of the image source: "night_sky" doesn't exist on
+    Konachan → "night" + "sky"; otherwise the most frequent tag containing the term."""
+    cache_file = os.path.join(THEMED_DIR, f"tags-{src.name}.json")
+    cache = load_json(cache_file, {})
+    out = []
+
+    def lookup(term):
+        if term in cache:
+            return cache[term]
+        found = src.lookup(term, timeout)
+        exact = next((n for n, c in found if n == term and c >= 5), None)
+        # otherwise: most frequent tag containing the term as a whole word (not "lightsaber" for "lights")
+        best = exact or next((n for n, c in sorted(found, key=lambda t: -t[1])
+                              if c >= 20 and term in n.split("_")), None)
+        res = [best] if best else []
+        if not res and term.endswith("s") and len(term) > 4:
+            res = lookup(term[:-1])
+        if not res and "_" in term:
+            res = [r for part in term.split("_") if len(part) > 2 for r in lookup(part)]
+        cache[term] = res
+        return res
+
+    for tag in tags:
+        neg = tag.startswith("-")
+        for r in lookup(tag.lstrip("-")):
+            r = ("-" + r) if neg else r
+            if r not in out:
+                out.append(r)
+    os.makedirs(THEMED_DIR, exist_ok=True)
+    write_atomic(cache_file, json.dumps(cache))
+    return out[:3]
+
+
+def themed_query(cfg, target):
+    """(Konachan tags without character, character choice config) for a target."""
+    tc = themed_cfg(cfg, target)
+    scfg = term_wall_cfg(cfg) if target == "terminal" else dict(
+        cfg, wallswitch=dict(wall_cfg(cfg), mood="", filter="strict" if wall_cfg(cfg)["filter"] == "strict" else "safe"))
+    own = search_tags(tc["tags"]) if tc["source"] in ("animesuche", "suche") else []
+    return own, scfg
+
+
+def themed_sig(cfg, target):
+    tc = themed_cfg(cfg, target)
+    own, _scfg = themed_query(cfg, target)
+    aid = (cfg.get("anime") or {}).get("id") if tc["source"] != "suche" else ""
+    return f"{tc['source']}|{aid}|{' '.join(own)}|{wall_src(cfg).name}"
+
+
+def themed_state(target):
+    d = os.path.join(THEMED_DIR, target)
+    return d, load_json(os.path.join(d, "state.json"), {})
+
+
+def themed_save(target, st):
+    d = os.path.join(THEMED_DIR, target)
+    os.makedirs(d, exist_ok=True)
+    st["seen"] = st.get("seen", [])[-300:]
+    write_atomic(os.path.join(d, "state.json"), json.dumps(st))
+    # delete everything that is neither current nor prepared
+    keep = {(st.get(k) or {}).get("file") for k in ("cur", "next")}
+    for n in os.listdir(d):
+        p = os.path.join(d, n)
+        if n.endswith(".jpg") and p not in keep:
+            os.remove(p)
+
+
+def themed_fetch(cfg, target, timeout=20):
+    """Downloads a new image as "prepared" (next). Errors → exception with a readable message."""
+    import random
+    tc = themed_cfg(cfg, target)
+    if tc["source"] not in THEMED_FETCHING:
+        raise ValueError(_('Für dieses Ziel ist kein eigenes Bild eingestellt'))
+    own, scfg = themed_query(cfg, target)
+    a = cfg.get("anime") or {}
+    if tc["source"] == "suche":
+        if not own:
+            raise ValueError(_('Keine Suchbegriffe eingetragen'))
+        char, base = "all", []
+    else:
+        if not a.get("wallTag"):
+            raise ValueError(_('Erst einen Anime wählen'))
+        char = random.choice(wall_chars(scfg))
+        base = [a["wallTag"] if char == "all" else char]
+    src = wall_src(cfg)
+    if own:
+        own = resolve_tags(src, own)
+        if not own:
+            raise LookupError(_('Diese Suchbegriffe kennt {name} nicht – englische Begriffe probieren (z. B. night, sky, city)', name=src.name))
+    d, st = themed_state(target)
+    banned = set(map(str, wall_state()["banned"]))
+    seen = set(st.get("seen", [])) | {str((st.get("cur") or {}).get("id"))}
+    for other in THEMED_TARGETS:            # not the same image in terminal and Firefox
+        ost = themed_state(other)[1]
+        seen |= {str((ost.get(k) or {}).get("id")) for k in ("cur", "next")}
+    w = dict(wall_cfg(scfg), minWidth=1600)
+    posts = [p for p in src.search(base + own, rating="s", limit=100, random=True, timeout=timeout)
+             if p["rating"] == "s" and post_ok(scfg, p, w, banned, char, ("s",))]
+    if not posts:
+        raise LookupError(_('Keine passenden Bilder gefunden – andere Suchbegriffe probieren'))
+    post = next((p for p in posts if post_key(p) not in seen), posts[0])
+    url = (post["large"] if target == "firefox" else post["sample"]) or post["url"]
+    raw = sources.download(url, timeout)
+    os.makedirs(d, exist_ok=True)
+    pid = post_key(post)
+    path = os.path.join(d, f"next-{pid}.jpg")
+    write_atomic(path, raw, binary=True)
+    d, st = themed_state(target)            # read again (parallel runs)
+    st["next"] = {"sig": themed_sig(cfg, target), "id": pid, "file": path,
+                  "tags": post["tags"], "author": post["author"], "site": src.name, "page": post["page"]}
+    st.setdefault("seen", []).append(pid)
+    themed_save(target, st)
+    return path
+
+
+def themed_take(cfg, target):
+    """The prepared image becomes current. True if it switched."""
+    d, st = themed_state(target)
+    nxt = st.get("next") or {}
+    if not nxt.get("file") or not os.path.isfile(nxt["file"]) or nxt.get("sig") != themed_sig(cfg, target):
+        return False
+    cur = os.path.join(d, f"cur-{nxt['id']}.jpg")
+    os.replace(nxt["file"], cur)
+    st["cur"] = dict(nxt, file=cur)
+    st.pop("next", None)
+    themed_save(target, st)
+    return True
+
+
+def themed_next_file(cfg, target):
+    _d, st = themed_state(target)
+    nxt = st.get("next") or {}
+    ok = nxt.get("file") and os.path.isfile(nxt["file"]) and nxt.get("sig") == themed_sig(cfg, target)
+    return nxt["file"] if ok else ""
+
+
+def themed_current(cfg, target, fetch=True):
+    """Image for the target matching the settings (downloads one if needed)."""
+    tc = themed_cfg(cfg, target)
+    if tc["source"] == "none":
+        return ""
+    if tc["source"] == "wallpaper":
+        return theme_image(cfg)
+    _d, st = themed_state(target)
+    cur = st.get("cur") or {}
+    if cur.get("file") and os.path.isfile(cur["file"]) and cur.get("sig") == themed_sig(cfg, target):
+        return cur["file"]
+    if themed_take(cfg, target):
+        return themed_state(target)[1]["cur"]["file"]
+    if fetch:
+        try:
+            themed_fetch(cfg, target, timeout=15)
+            if themed_take(cfg, target):
+                return themed_state(target)[1]["cur"]["file"]
+        except Exception as exc:
+            log(f"{target}-bild: {exc}")
+    return theme_image(cfg)
+
+
+def themed_lock(target):
+    """Prevents two windows opened at the same time from downloading twice."""
+    import fcntl
+    os.makedirs(THEMED_DIR, exist_ok=True)
+    fh = open(os.path.join(THEMED_DIR, f".{target}.lock"), "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return None
+    return fh
+
+
+def themed_rotate(cfg, target):
+    """Background run when the terminal or Firefox starts: prepare a new image for
+    next time (terminal: promote and render right away)."""
+    lock = themed_lock(target)
+    if not lock:
+        return
+    try:
+        if target == "terminal":
+            if not themed_take(cfg, target):
+                themed_fetch(cfg, target)
+                themed_take(cfg, target)
+            terminal_bg_image(cfg)
+            themed_fetch(cfg, target)
+        else:
+            themed_fetch(cfg, target)
+            prof = firefox_profile()
+            if prof:
+                firefox_render(cfg, prof, themed_next_file(cfg, target), nxt=True)
+    except Exception as exc:
+        log(f"{target}-wechsel: {exc}")
+    finally:
+        lock.close()
+
+
+def themed_new(cfg, target):
+    """"⟳ New image" in the Control Center: fetch a new image right away and apply it."""
+    themed_fetch(cfg, target)
+    themed_take(cfg, target)
+    if target == "terminal":
+        apply_konsole(cfg)             # open kitty windows reload the image immediately
+        say(_('Neues Terminal-Bild (kitty sofort, Konsole im nächsten Fenster)'))
+    else:
+        apply_firefox(cfg, quiet=True)
+        say(_("Neues Firefox-Bild – sichtbar nach Firefox-Neustart") if firefox_running() else _("Neues Firefox-Bild – beim nächsten Start"))
+    spawn_bg(["themed-rotate", target] if target == "firefox" else ["themed-prefetch", target])
+
+
+def themed_status(cfg):
+    out = {}
+    for target in THEMED_TARGETS:
+        tc = themed_cfg(cfg, target)
+        _d, st = themed_state(target)
+        cur = st.get("cur") or {}
+        valid = cur.get("file") and os.path.isfile(cur["file"]) and cur.get("sig") == themed_sig(cfg, target)
+        img = cur["file"] if valid else (theme_image(cfg) if tc["source"] == "wallpaper" else "")
+        out[target] = {"source": tc["source"], "image": img, "id": cur.get("id", "") if valid else "",
+                       "author": cur.get("author", "") if valid else "",
+                       "ready": bool(themed_next_file(cfg, target))}
+    return out
+
+
+def spawn_bg(args):
+    subprocess.Popen([os.path.join(HOME, ".local", "bin", "animestage"), *args],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+
+
+# ---- Firefox
+
+def firefox_profile():
+    import configparser
+    for base in FF_BASES:
+        ini = os.path.join(base, "profiles.ini")
+        if not os.path.exists(ini):
+            continue
+        cp = configparser.ConfigParser(strict=False, interpolation=None)
+        cp.optionxform = str
+        cp.read(ini, encoding="utf-8")
+        path = ""
+        for sec in cp.sections():           # default profile of this installation
+            if sec.startswith("Install") and cp[sec].get("Default"):
+                path = cp[sec]["Default"]
+                break
+        if not path:
+            for sec in cp.sections():
+                if sec.startswith("Profile") and cp[sec].get("Default") == "1":
+                    path = cp[sec].get("Path", "")
+        if not path:
+            profs = [cp[s].get("Path", "") for s in cp.sections() if s.startswith("Profile")]
+            path = profs[0] if profs else ""
+        if path:
+            full = path if os.path.isabs(path) else os.path.join(base, path)
+            if os.path.isdir(full):
+                return full
+    return ""
+
+
+def firefox_running():
+    return subprocess.run(["pgrep", "-f", r"lib(64)?/firefox/firefox( |$)"], capture_output=True).returncode == 0
+
+
+def ensure_import(css_file, name):
+    line = f'@import "{name}";'
+    text = open(css_file, encoding="utf-8").read() if os.path.exists(css_file) else ""
+    if line not in text:
+        write_atomic(css_file, line + "\n" + text)
+
+
+def remove_import(css_file, name):
+    if os.path.exists(css_file):
+        text = open(css_file, encoding="utf-8").read().replace(f'@import "{name}";\n', "").replace(f'@import "{name}";', "")
+        if text.strip():
+            write_atomic(css_file, text)
+        else:
+            os.remove(css_file)
+
+
+def rgba(col, a):
+    r, g, b = hex2rgb(col)
+    return f"rgba({r}, {g}, {b}, {a})"
+
+
+FF_FILES = ("animestage-newtab.jpg", "animestage-chrome.css", "animestage-content.css")
+
+
+def ff_name(name, nxt):
+    base, ext = os.path.splitext(name)
+    return f"{base}.next{ext}" if nxt else name
+
+
+def firefox_render(cfg, prof, img, nxt=False):
+    """Writes image + theme CSS. nxt=True: prepared version for the next start.
+    With "colors from the image" the Firefox toolbar matches the own image."""
+    fc = themed_cfg(cfg, "firefox")
+    if nxt and not img:
+        return
+    pcfg = cfg
+    if img and fc.get("ownColors", True) and fc["source"] in THEMED_FETCHING:
+        try:
+            pcfg = dict(cfg, colors=colors_from_image(img, cfg.get("colors")))
+        except Exception as exc:
+            log(f"firefox farben: {exc}")
+    p = palette(pcfg)
+    chrome = os.path.join(prof, "chrome")
+    os.makedirs(chrome, exist_ok=True)
+    has_img = False
+    if img:
+        try:
+            darkened(img, os.path.join(chrome, ff_name("animestage-newtab.jpg", nxt)), p["bg"],
+                     float(fc.get("dim", 0.35)), (2560, 1440))
+            has_img = True
+        except Exception as exc:
+            log(f"firefox bild: {exc}")
+    if not has_img and not nxt and os.path.exists(os.path.join(chrome, "animestage-newtab.jpg")):
+        os.remove(os.path.join(chrome, "animestage-newtab.jpg"))
+    bg, sf, sa, tx, mu, ac, a2, on = (p[k] for k in ("bg", "surface", "surfaceAlt", "text", "muted", "accent", "accent2", "onAccent"))
+    write_atomic(os.path.join(chrome, ff_name("animestage-chrome.css", nxt)), f"""{GEN_MARK}
+:root {{
+  --lwt-accent-color: {bg} !important;
+  --lwt-text-color: {tx} !important;
+  --toolbar-bgcolor: {sf} !important;
+  --toolbar-color: {tx} !important;
+  --toolbar-field-background-color: {sa} !important;
+  --toolbar-field-color: {tx} !important;
+  --toolbar-field-focus-background-color: {sa} !important;
+  --toolbar-field-focus-color: {tx} !important;
+  --toolbar-field-focus-border-color: {ac} !important;
+  --toolbarbutton-icon-fill-attention: {ac} !important;
+  --tab-selected-bgcolor: {sa} !important;
+  --tab-selected-textcolor: {tx} !important;
+  --arrowpanel-background: {sf} !important;
+  --arrowpanel-color: {tx} !important;
+  --arrowpanel-border-color: {rgba(ac, 0.35)} !important;
+  --focus-outline-color: {ac} !important;
+  --urlbarView-highlight-background: {ac} !important;
+  --urlbarView-highlight-color: {on} !important;
+  --sidebar-background-color: {sf} !important;
+  --sidebar-text-color: {tx} !important;
+}}
+#navigator-toolbox {{ background-color: {bg} !important; border-bottom: 1px solid {rgba(ac, 0.3)} !important; }}
+.tab-background:is([selected], [multiselected]) {{ background: {sa} !important; box-shadow: inset 0 -2px 0 {ac} !important; }}
+.tabbrowser-tab:hover .tab-background:not([selected]) {{ background: {rgba(tx, 0.06)} !important; }}
+#urlbar[focused] > #urlbar-background {{ outline-color: {ac} !important; }}
+""")
+    newtab_bg = (f'linear-gradient({rgba(bg, 0.45)}, {rgba(bg, 0.8)}), url("animestage-newtab.jpg") center / cover fixed no-repeat'
+                 if has_img else bg)
+    write_atomic(os.path.join(chrome, ff_name("animestage-content.css", nxt)), f"""{GEN_MARK}
+@-moz-document url("about:newtab"), url("about:home"), url("about:privatebrowsing") {{
+  :root {{
+    --newtab-background-color: {bg} !important;
+    --newtab-background-color-secondary: {sf} !important;
+    --newtab-text-primary-color: {tx} !important;
+    --newtab-primary-action-background: {ac} !important;
+  }}
+  body {{ background: {newtab_bg} !important; }}
+}}
+""")
+
+
+def apply_firefox(cfg, quiet=False):
+    if not apps_cfg(cfg)["firefox"]:
+        return
+    prof = firefox_profile()
+    if not prof:
+        say(_('Firefox: kein Profil gefunden – übersprungen'))
+        return
+    fc = themed_cfg(cfg, "firefox")
+    userjs = os.path.join(prof, "user.js")
+    text = open(userjs, encoding="utf-8").read() if os.path.exists(userjs) else ""
+    if FF_PREF not in text:
+        write_atomic(userjs, text + ("\n" if text and not text.endswith("\n") else "") + FF_PREF_MARK + "\n" + FF_PREF + "\n")
+    firefox_render(cfg, prof, themed_current(cfg, "firefox"))
+    chrome = os.path.join(prof, "chrome")
+    rotating = fc["everyStart"] and fc["source"] in THEMED_FETCHING
+    nxt = themed_next_file(cfg, "firefox") if rotating else ""
+    if nxt:
+        firefox_render(cfg, prof, nxt, nxt=True)       # prepared image in the current colors
+    else:
+        for n in FF_FILES:
+            if os.path.exists(os.path.join(chrome, ff_name(n, True))):
+                os.remove(os.path.join(chrome, ff_name(n, True)))
+    ensure_import(os.path.join(chrome, "userChrome.css"), "animestage-chrome.css")
+    ensure_import(os.path.join(chrome, "userContent.css"), "animestage-content.css")
+    firefox_launcher(rotating)
+    if rotating and not nxt:
+        spawn_bg(["themed-rotate", "firefox"])
+    if not quiet:
+        say(_('Firefox-Theme aktualisiert (sichtbar nach Firefox-Neustart)'))
+
+
+# Launcher entry: open Firefox via `animestage firefox-start` – it swaps in
+# the prepared image before starting (takes milliseconds) and then downloads
+# the next one in the background.
+FF_DESKTOP_SOURCES = [
+    "/var/lib/flatpak/exports/share/applications/org.mozilla.firefox.desktop",
+    os.path.join(XDG_DATA, "flatpak", "exports", "share", "applications", "org.mozilla.firefox.desktop"),
+    "/usr/share/applications/org.mozilla.firefox.desktop",
+    "/usr/share/applications/firefox.desktop",
+]
+FF_WRAP_MARK = "X-AnimeStage-Wrapper=true"
+
+
+def firefox_launcher(on):
+    changed = False
+    sources = {}
+    for src in FF_DESKTOP_SOURCES:          # first existing source per file name
+        name = os.path.basename(src)
+        if name not in sources or (not os.path.exists(sources[name]) and os.path.exists(src)):
+            sources[name] = src
+    for src in sources.values():
+        dest = os.path.join(XDG_DATA, "applications", os.path.basename(src))
+        ours = os.path.exists(dest) and FF_WRAP_MARK in open(dest, encoding="utf-8", errors="replace").read()
+        if os.path.exists(dest) and not ours:
+            continue                        # the user's own customization – don't touch
+        if on and os.path.exists(src):
+            bin_ = os.path.join(HOME, ".local", "bin", "animestage")
+            lines = []
+            for line in open(src, encoding="utf-8").read().splitlines():
+                if line.startswith("Exec=") and "--ProfileManager" not in line:
+                    line = f"Exec={bin_} firefox-start {line[5:]}"
+                lines.append(line)
+                if line == "[Desktop Entry]":
+                    lines.append(FF_WRAP_MARK)
+            text = "\n".join(lines) + "\n"
+            if not ours or open(dest, encoding="utf-8").read() != text:
+                write_atomic(dest, text)
+                changed = True
+        elif ours:
+            os.remove(dest)
+            changed = True
+    if changed:
+        run(["kbuildsycoca6"])
+
+
+def firefox_start(argv):
+    """Runs when Firefox is clicked: swap in the prepared image + matching colors,
+    start Firefox, download the next image in the background."""
+    try:
+        cfg = load_config()
+        i18n_setup(cfg)
+        fc = themed_cfg(cfg, "firefox")
+        if apps_cfg(cfg)["firefox"] and fc["everyStart"] and fc["source"] in THEMED_FETCHING and not firefox_running():
+            prof = firefox_profile()
+            chrome = os.path.join(prof, "chrome") if prof else ""
+            pre = [os.path.join(chrome, ff_name(n, True)) for n in FF_FILES]
+            if chrome and all(os.path.exists(p) for p in pre) and themed_take(cfg, "firefox"):
+                for n in FF_FILES:
+                    os.replace(os.path.join(chrome, ff_name(n, True)), os.path.join(chrome, n))
+            spawn_bg(["themed-rotate", "firefox"])
+    except Exception as exc:
+        log(f"firefox-start: {exc}")
+    if argv:
+        os.execvp(argv[0], argv)
+
+
+def firefox_off():
+    firefox_launcher(False)
+    prof = firefox_profile()
+    if not prof:
+        return
+    userjs = os.path.join(prof, "user.js")
+    if os.path.exists(userjs):
+        text = open(userjs, encoding="utf-8").read()
+        if FF_PREF_MARK in text:   # only if AnimeStage added the pref
+            write_atomic(userjs, text.replace(FF_PREF_MARK + "\n" + FF_PREF + "\n", "").replace(FF_PREF_MARK + "\n", ""))
+    chrome = os.path.join(prof, "chrome")
+    remove_import(os.path.join(chrome, "userChrome.css"), "animestage-chrome.css")
+    remove_import(os.path.join(chrome, "userContent.css"), "animestage-content.css")
+    for n in FF_FILES:
+        for nxt in (False, True):
+            if os.path.exists(os.path.join(chrome, ff_name(n, nxt))):
+                os.remove(os.path.join(chrome, ff_name(n, nxt)))
+    say(_('Firefox-Theme entfernt (nach Firefox-Neustart)'))
+
+
+# ---- VS Code
+
+def vscode_colors(cfg):
+    p = palette(cfg)
+    t = term_colors(cfg)
+    bg, sf, sa, tx, mu, ac, a2 = (p[k] for k in ("bg", "surface", "surfaceAlt", "text", "muted", "accent", "accent2"))
+
+    def a(col, alpha):
+        return col + format(int(alpha * 255), "02x")
+    out = {
+        "editor.background": bg, "editorGutter.background": bg,
+        "editor.selectionBackground": a(ac, 0.28), "editor.lineHighlightBackground": a(tx, 0.04),
+        "editorCursor.foreground": ac, "editorLineNumber.activeForeground": ac,
+        "sideBar.background": sf, "sideBarSectionHeader.background": sf, "sideBar.border": a(ac, 0.15),
+        "activityBar.background": bg, "activityBar.foreground": ac, "activityBar.activeBorder": ac,
+        "activityBarBadge.background": a2, "activityBarBadge.foreground": p["onAccent2"],
+        "titleBar.activeBackground": bg, "titleBar.inactiveBackground": bg, "titleBar.activeForeground": tx,
+        "statusBar.background": sf, "statusBar.foreground": mu, "statusBar.border": a(ac, 0.25),
+        "statusBarItem.remoteBackground": ac, "statusBarItem.remoteForeground": p["onAccent"],
+        "editorGroupHeader.tabsBackground": sf, "tab.inactiveBackground": sf, "tab.activeBackground": bg,
+        "tab.activeBorderTop": ac, "tab.border": sf,
+        "panel.background": bg, "panel.border": a(ac, 0.2), "panelTitle.activeBorder": ac,
+        "terminal.background": t["bg"], "terminal.foreground": t["fg"], "terminalCursor.foreground": t["cursor"],
+        "focusBorder": a(ac, 0.6), "button.background": ac, "button.foreground": p["onAccent"],
+        "progressBar.background": ac, "badge.background": a2, "badge.foreground": p["onAccent2"],
+        "list.activeSelectionBackground": a(ac, 0.25), "list.inactiveSelectionBackground": a(ac, 0.12),
+        "list.hoverBackground": a(tx, 0.05), "textLink.foreground": ac,
+        "input.background": sa, "dropdown.background": sa, "editorWidget.background": sf,
+        "quickInput.background": sf, "scrollbarSlider.background": a(mu, 0.2),
+        "scrollbarSlider.hoverBackground": a(ac, 0.35),
+    }
+    names = ["Black", "Red", "Green", "Yellow", "Blue", "Magenta", "Cyan", "White"]
+    for i, col in enumerate(t["ansi"]):
+        out[f"terminal.ansi{'Bright' if i >= 8 else ''}{names[i % 8]}"] = col
+    return out
+
+
+def _vscode_files():
+    return [f for f in VSCODE_SETTINGS if os.path.isdir(os.path.dirname(f))]
+
+
+def apply_vscode(cfg, off=False):
+    if not off and not apps_cfg(cfg)["vscode"]:
+        return
+    state = load_json(APP_STATE, {})
+    managed = state.get("vscodeKeys", [])
+    colors = {} if off else vscode_colors(cfg)
+    done = 0
+    for f in _vscode_files():
+        try:
+            data = load_json(f, None) if os.path.exists(f) else {}
+            if data is None:
+                say(_('VS Code: {f} enthält Kommentare/Fehler – nicht verändert', f=f))
+                continue
+            cc = dict(data.get("workbench.colorCustomizations") or {})
+            for k in managed:            # only replace/remove our own entries
+                cc.pop(k, None)
+            cc.update(colors)
+            if cc:
+                data["workbench.colorCustomizations"] = cc
+            else:
+                data.pop("workbench.colorCustomizations", None)
+            # images in the integrated terminal (for the greeting) – only remove if we set it
+            if off:
+                if state.get("vscodeImages"):
+                    data.pop("terminal.integrated.enableImages", None)
+            elif "terminal.integrated.enableImages" not in data:
+                data["terminal.integrated.enableImages"] = True
+                state["vscodeImages"] = True
+            write_atomic(f, json.dumps(data, indent=4, ensure_ascii=False) + "\n")
+            done += 1
+        except Exception as exc:
+            log(f"vscode {f}: {exc}")
+    state["vscodeKeys"] = sorted(colors)
+    if off:
+        state.pop("vscodeImages", None)
+    write_atomic(APP_STATE, json.dumps(state))
+    if done:
+        say(_("VS Code: Farben entfernt") if off else _("VS Code: Farben übernommen (sofort sichtbar)"))
+
+
+def apps_toggle(cfg, app, on):
+    cfg.setdefault("apps", {})[app] = on
+    save_config(cfg)
+    if app == "firefox":
+        apply_firefox(cfg) if on else firefox_off()
+    else:
+        apply_vscode(cfg, off=not on)
+
+
+# --------------------------------------------------------------------------
+# Updates from GitHub
+# --------------------------------------------------------------------------
+# Releases on github.com/propanisen/AnimeStage carry the version as tag (v1.2.0).
+# A daily systemd timer only *checks* and shows a notification; installing is
+# always started by the user (Control Center or `animestage update install`).
+
+UPDATE_REPO = "propanisen/AnimeStage"
+UPDATE_STATE = os.path.join(STATE_DIR, "update.json")
+UPDATE_UNITS = ("animestage-update.service", "animestage-update.timer")
+
+
+def version_tuple(v):
+    return tuple(int(x) for x in re.findall(r"\d+", str(v))[:3]) or (0,)
+
+
+def installed_version():
+    here = os.path.dirname(os.path.realpath(__file__))
+    for path in (os.path.join(here, "..", "VERSION"), os.path.join(DATA_DIR, "VERSION")):
+        if os.path.exists(path):
+            return open(path, encoding="utf-8").read().strip()
+    return "0"
+
+
+def update_cfg(cfg):
+    return {"check": True, "auto": False, **(cfg.get("updates") or {})}
+
+
+def update_state():
+    try:
+        return json.load(open(UPDATE_STATE, encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def update_check(cfg):
+    """Ask GitHub for the latest release. Returns the state dict (also saved)."""
+    old = update_state()
+    cur = installed_version()
+    st = {"checked": int(time.time()), "current": cur, "notified": old.get("notified", "")}
+    try:
+        rel = http_json(f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest", 20)
+        st.update({"tag": rel["tag_name"], "latest": rel["tag_name"].lstrip("vV"),
+                   "url": rel.get("html_url", ""), "notes": (rel.get("body") or "")[:2000]})
+        st["available"] = version_tuple(st["latest"]) > version_tuple(cur)
+    except urllib.error.HTTPError as exc:
+        st.update({"available": False, "error": _("Noch keine Version auf GitHub veröffentlicht")
+                   if exc.code == 404 else f"HTTP {exc.code}"})
+    except Exception as exc:  # offline, DNS, rate limit …
+        st.update({"available": False, "error": str(exc)[:200]})
+    write_atomic(UPDATE_STATE, json.dumps(st, ensure_ascii=False))
+    return st
+
+
+def notify(title, body, actions=None):
+    """Desktop notification; with actions it waits and returns the chosen action name."""
+    if not shutil.which("notify-send"):
+        return ""
+    cmd = ["notify-send", "-a", "AnimeStage", "-i", "animestage", title, body]
+    for name, label in (actions or {}).items():
+        cmd[1:1] = ["-A", f"{name}={label}"]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=6 * 3600 if actions else 30)
+        return res.stdout.strip()
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+
+
+def update_background(cfg):
+    """Daily timer: check, then install automatically (setting) or offer an
+    "Install now" button in a notification. Shown once per version."""
+    st = update_check(cfg)
+    if not st.get("available") or st.get("notified") == st["tag"]:
+        return
+    st["notified"] = st["tag"]
+    write_atomic(UPDATE_STATE, json.dumps(st, ensure_ascii=False))
+    if not update_cfg(cfg)["auto"]:
+        choice = notify(_("AnimeStage-Update verfügbar"),
+                        _("Version {version} – im Kontrollzentrum unter System installieren.", version=st["latest"]),
+                        {"install": _("Jetzt installieren")})
+        if choice != "install":
+            return
+    try:
+        update_install(cfg)
+        notify(_("AnimeStage aktualisiert"), _("Update installiert: {version}", version=st["latest"]))
+    except SystemExit as exc:
+        notify(_("AnimeStage-Update fehlgeschlagen"), str(exc.code or ""))
+        raise
+
+
+def update_install(cfg):
+    st = update_check(cfg)
+    if st.get("error"):
+        sys.exit(_("Update-Prüfung fehlgeschlagen: {error}", error=st["error"]))
+    if not st.get("available"):
+        say(_("AnimeStage ist aktuell ({version})", version=st["current"]))
+        return
+    import io
+    say(_("Lade AnimeStage {version} von GitHub", version=st["latest"]))
+    raw = http_get(f"https://github.com/{UPDATE_REPO}/archive/refs/tags/{urllib.parse.quote(st['tag'])}.tar.gz", 300)
+    dest = os.path.join(XDG_CACHE, "animestage", "update")
+    shutil.rmtree(dest, ignore_errors=True)
+    os.makedirs(dest)
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tf:
+        tf.extractall(dest, filter="data")
+    dirs = [d for d in os.listdir(dest) if os.path.isfile(os.path.join(dest, d, "update.sh"))]
+    if len(dirs) != 1:
+        sys.exit(_("Update fehlgeschlagen – Details: {log}", log=LOG_FILE))
+    src = os.path.join(dest, dirs[0])
+    say(_("Installiere Update {version}", version=st["latest"]))
+    # update.sh = install.sh --profile core --yes: selftest gate, backup, keeps all settings
+    res = subprocess.run(["bash", os.path.join(src, "update.sh")], cwd=src)
+    if res.returncode != 0:
+        sys.exit(_("Update fehlgeschlagen – Details: {log}", log=LOG_FILE))
+    shutil.rmtree(dest, ignore_errors=True)
+    update_check(cfg)
+    say(_("Update installiert: {version}", version=st["latest"]))
+
+
+def update_timer(on):
+    unit_dir = os.path.join(XDG_CONFIG, "systemd", "user")
+    svc, tmr = (os.path.join(unit_dir, u) for u in UPDATE_UNITS)
+    if on:
+        write_atomic(svc, "\n".join([
+            "[Unit]", "Description=AnimeStage: check GitHub for updates", "",
+            "[Service]", "Type=oneshot",
+            f"ExecStart={os.path.join(HOME, '.local', 'bin', 'animestage')} update check --notify",
+            "TimeoutStartSec=infinity", "",
+        ]))
+        write_atomic(tmr, "\n".join([
+            "[Unit]", "Description=AnimeStage: daily update check", "",
+            "[Timer]", "OnCalendar=daily", "Persistent=true", "RandomizedDelaySec=1h", "",
+            "[Install]", "WantedBy=timers.target", "",
+        ]))
+        run(["systemctl", "--user", "daemon-reload"])
+        run(["systemctl", "--user", "enable", "--now", UPDATE_UNITS[1]])
+    else:
+        run(["systemctl", "--user", "disable", "--now", UPDATE_UNITS[1]])
+        for path in (svc, tmr):
+            if os.path.exists(path):
+                os.remove(path)
+        run(["systemctl", "--user", "daemon-reload"])
+
+
+def uninstall_gui():
+    """Start the graphical uninstaller from the installer copy (detached: it removes this program)."""
+    script = os.path.join(DATA_DIR, "source", "install.sh")
+    if not os.path.exists(script):
+        sys.exit(_("Installer-Kopie fehlt – bitte ./uninstall.sh im heruntergeladenen Ordner starten"))
+    subprocess.Popen(["bash", script, "--uninstall", "--gui"], start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=os.path.dirname(script))
+    say(_("Deinstallation gestartet"))
+
+
+def update_cmd(cfg, action, notify=False):
+    if action == "status":
+        st = update_state()
+        st.update({"current": installed_version(), "check": update_cfg(cfg)["check"],
+                   "auto": update_cfg(cfg)["auto"], "repo": UPDATE_REPO})
+        if st.get("latest"):
+            st["available"] = version_tuple(st["latest"]) > version_tuple(st["current"])
+        print(json.dumps(st, ensure_ascii=False))
+    elif action == "check" and notify:   # daily timer
+        update_background(cfg)
+    elif action == "check":
+        st = update_check(cfg)
+        if st.get("error"):
+            sys.exit(_("Update-Prüfung fehlgeschlagen: {error}", error=st["error"]))
+        if st["available"]:
+            say(_("Neue Version verfügbar: {version} (installiert: {current})", version=st["latest"], current=st["current"]))
+        else:
+            say(_("AnimeStage ist aktuell ({version})", version=st["current"]))
+    elif action == "install":
+        update_install(cfg)
+    elif action in ("on", "off"):
+        cfg["updates"] = dict(update_cfg(cfg), check=action == "on")
+        save_config(cfg)
+        update_timer(action == "on")
+        say(_("Automatische Update-Prüfung an (täglich)") if action == "on" else _("Automatische Update-Prüfung aus"))
+    elif action in ("auto", "remind"):   # the three modes: auto / remind / off
+        cfg["updates"] = dict(update_cfg(cfg), check=True, auto=action == "auto")
+        save_config(cfg)
+        update_timer(True)
+        say(_("Updates werden automatisch installiert") if action == "auto" else _("Updates erst nach deinem Klick installieren"))
+    elif action in ("auto-on", "auto-off"):
+        cfg["updates"] = dict(update_cfg(cfg), auto=action == "auto-on")
+        if action == "auto-on":
+            cfg["updates"]["check"] = True
+            update_timer(True)
+        save_config(cfg)
+        say(_("Updates werden automatisch installiert") if action == "auto-on" else _("Updates erst nach deinem Klick installieren"))
+    elif action == "sync":            # installer: timer according to the config
+        update_timer(update_cfg(cfg)["check"])
+    elif action == "remove-timer":    # uninstaller: keep the setting, remove the timer
+        update_timer(False)
+
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+
+APPLY_STEPS = {
+    "colors": apply_colors,
+    "style": apply_style,
+    "deco": apply_deco,
+    "konsole": apply_konsole,
+    "kvantum": apply_kvantum,
+    "font": apply_font,
+    "wallpaper": apply_wallpaper,
+    "lock": apply_lock,
+    "splash": apply_splash,
+    "icons": apply_icons,
+    "firefox": apply_firefox,
+    "vscode": apply_vscode,
+    "rules": apply_window_rule,
+    "taskbar": apply_taskbar,
+}
+APPLY_ALL = ["colors", "style", "icons", "deco", "konsole", "kvantum", "font", "wallpaper", "lock", "splash", "firefox", "vscode", "rules", "taskbar"]
+
+
+def cmd_apply(cfg, parts):
+    steps = APPLY_ALL if not parts or "all" in parts else parts
+    for step in steps:
+        fn = APPLY_STEPS.get(step)
+        if not fn:
+            say(_('unbekannter Schritt: {step}', step=step))
+            continue
+        try:
+            fn(cfg)
+        except Exception as exc:
+            say(_('{step}: Fehler – {exc}', step=step, exc=exc))
+
+
+def status(cfg):
+    def mark(ok):
+        return "✓" if ok else "·"
+    scheme = run(["kreadconfig6", "--file", "kdeglobals", "--group", "General", "--key", "ColorScheme"])
+    theme = run(["kreadconfig6", "--file", "plasmarc", "--group", "Theme", "--key", "name"])
+    plasmoids = os.path.join(XDG_DATA, "plasma", "plasmoids")
+    widgets = sorted(n for n in os.listdir(plasmoids) if n.startswith("org.animestage.")) if os.path.isdir(plasmoids) else []
+    a = cfg.get("anime") or {}
+    labels = ["Anime", _("Akzent"), _("Farbschema"), _("Plasma-Stil"), "Widgets", _("Wechsel"), _("Anmeldung"), "Backups"]
+    width = max(len(x) for x in labels) + 2
+
+    def row(ok, label, value):
+        print(f"{mark(ok) if ok is not None else ' '} {label:<{width}}{value}")
+    print(f"  {'Anime':<{width}}{a.get('title') or _('– noch keiner –')}  ({_('{n} Figuren', n=len(a.get('characters', [])))})")
+    row(None, _("Akzent"), f"{cfg['colors']['accent']}  /  {cfg['colors']['accent2']}")
+    row(scheme and scheme.stdout.strip() == THEME_NAME, _("Farbschema"), scheme.stdout.strip() if scheme else "?")
+    row(theme and theme.stdout.strip() == THEME_NAME, _("Plasma-Stil"), theme.stdout.strip() if theme else "?")
+    row(len(widgets) >= 5, "Widgets", f"{len(widgets)}: {', '.join(w.split('.')[-1] for w in widgets)}")
+    row(wall_cfg(cfg)['enabled'], _("Wechsel"), _("alle {minutes} Min., Filter {filter}", minutes=wall_cfg(cfg)['minutes'], filter=wall_cfg(cfg)['filter']))
+    row(login_ready(), _("Anmeldung"), "")
+    row(None, "Backups", ", ".join(list_backups()) or "–")
+
+
+def source_cmd(cfg, action, purpose="", name=""):
+    """Show, check and switch image sources. On a switch the current anime's tags
+    are looked up again on the new source (every site names things differently)."""
+    cur = dict(sources.DEFAULTS, **(cfg.get("sources") or {}))
+    if action == "list":
+        print(json.dumps({"current": {k: sources.for_purpose(v, k).name for k, v in cur.items()},
+                          "options": sources.listing()}, ensure_ascii=False))
+        return
+    if action == "check":
+        names = [purpose] if purpose in sources.SOURCES else sorted({sources.for_purpose(v, k).name for k, v in cur.items()})
+        bad = 0
+        for n in names:
+            ok, msg = sources.check(n)
+            detail = _("{n} Bilder gefunden", n=msg) if ok else msg
+            print(f"{'✓' if ok else '✗'} {n}: {_('erreichbar') if ok else _('nicht erreichbar')} ({detail})")
+            bad += not ok
+        if bad:
+            sys.exit(1)
+        return
+    if purpose not in sources.PURPOSES or name not in sources.PURPOSES[purpose]:
+        sys.exit(_("Mögliche Quellen: {list}", list=", ".join(
+            f"{p}: {'/'.join(n)}" for p, n in sources.PURPOSES.items())))
+    ok, msg = sources.check(name)
+    if not ok:
+        sys.exit(_('{name} ist gerade nicht erreichbar ({msg}) – Quelle nicht gewechselt', name=name, msg=msg))
+    cfg.setdefault("sources", {})[purpose] = name
+    save_config(cfg)
+    a = cfg.get("anime") or {}
+    if a.get("id") and (a.get("tagSites") or {}).get(purpose) != name:
+        say(_("Suche {title} bei {site} …", title=a.get('title'), site=name))
+        cfg = anime_set(cfg, a["id"], quiet=True)
+        a = cfg["anime"]
+        found = a.get("wallTag") if purpose == "wallpaper" else a.get("cutTag")
+        if not found:
+            say(_('⚠ {name} kennt diesen Anime nicht – dort gibt es keine passenden Bilder', name=name))
+        elif purpose == "wallpaper":
+            say("  " + _("{n} Figuren gefunden", n=len(a.get('characters', []))))
+            if wall_cfg(cfg)["enabled"]:
+                wall_next(cfg, quiet=True)
+    say("✓ " + (_("Bildquelle für Hintergründe: {label}", label=sources.get(name).label) if purpose == "wallpaper"
+                else _("Bildquelle für Freisteller: {label}", label=sources.get(name).label)))
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["firefox-start"]:          # from the Firefox launcher, rest = Firefox command
+        firefox_start(argv[1:])
+        return
+    ap = argparse.ArgumentParser(prog="animestage", description="AnimeStage – control the anime theme for KDE Plasma")
+    ap.add_argument("--version", action="version", version=f"AnimeStage {installed_version()}")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("init", help="create the config (if missing)")
+    g = sub.add_parser("get", help="read the config")
+    g.add_argument("path", nargs="?", default="")
+    s = sub.add_parser("set", help="set a value, e.g. set colors.accent '#39C5BB'")
+    s.add_argument("path")
+    s.add_argument("value")
+    s.add_argument("--apply", nargs="*", help="apply these steps afterwards")
+    se = sub.add_parser("search", help="search anime on AniList (JSON)")
+    se.add_argument("text", nargs="+")
+    an = sub.add_parser("anime", help="use an anime: anime ANILIST-ID [--apply]")
+    an.add_argument("id")
+    an.add_argument("--apply", action="store_true", help="apply the theme and fetch a new wallpaper")
+    ch = sub.add_parser("adult", help="mark a character without age as adult: adult CHARACTER-ID on|off")
+    ch.add_argument("char_id", type=int)
+    ch.add_argument("state", choices=["on", "off"])
+    cu = sub.add_parser("cuts", help="download more cutouts (characters without background)")
+    cu.add_argument("count", nargs="?", type=int, default=6)
+    sub.add_parser("colors-from-wallpaper", help="take colors once from the current wallpaper")
+    a = sub.add_parser("apply", help="apply theme parts: " + ", ".join(APPLY_ALL))
+    a.add_argument("parts", nargs="*")
+    ad = sub.add_parser("use-image", help="use your own image for a slot")
+    ad.add_argument("file")
+    ad.add_argument("slot", choices=["launcher", "splash"])
+    im = sub.add_parser("images", help="list images for launcher/splash")
+    im.add_argument("--json", action="store_true")
+    fo = sub.add_parser("add-folder", help="add your own image folder")
+    fo.add_argument("folder")
+    fr = sub.add_parser("remove-folder", help="remove your own image folder")
+    fr.add_argument("folder")
+    sub.add_parser("fonts", help="install M PLUS Rounded 1c")
+    sub.add_parser("backup", help="back up the current KDE settings")
+    rs = sub.add_parser("restore", help="restore a backup (default: original)")
+    rs.add_argument("name", nargs="?", default="original")
+    sub.add_parser("backups", help="list backups")
+    sub.add_parser("layout", help="set up the AnimeStage panel and desktop widgets (with backup)")
+    sub.add_parser("layout-script", help="only print the layout script")
+    sub.add_parser("status", help="installation status")
+    sub.add_parser("migrate", help="migrate settings/panel from the previous version VocaStage")
+    sub.add_parser("selftest", help="check the minor-protection rules")
+    sub.add_parser("unrule", help=argparse.SUPPRESS)
+    ap_ = sub.add_parser("apps", help="Firefox/VS Code in the theme colors: apps firefox|vscode on|off")
+    ap_.add_argument("app", choices=["firefox", "vscode"])
+    ap_.add_argument("state", choices=["on", "off"])
+    t = sub.add_parser("terminal", help="terminal package: greeting, prompt, aliases (on/off)")
+    t.add_argument("state", choices=["on", "off", "kitty", "konsole"],
+                   help="on/off: greeting+prompt; kitty/konsole: default terminal (kitty is installed if needed)")
+    t.add_argument("--tools", action="store_true", help="install starship, eza, bat, zoxide + kitty")
+    sub.add_parser("greet", help="show the greeting with image and system info")
+    th = sub.add_parser("themed", help="own images for terminal background/Firefox: themed new|status [terminal|firefox]")
+    th.add_argument("action", choices=["new", "status"])
+    th.add_argument("target", nargs="?", choices=list(THEMED_TARGETS), default="terminal")
+    th.add_argument("--tags", default=None, help="set new search terms (own search)")
+    for name in ("themed-rotate", "themed-prefetch"):
+        sub.add_parser(name, help=argparse.SUPPRESS).add_argument("target", choices=list(THEMED_TARGETS))
+    tf = sub.add_parser("term-fetch", help=argparse.SUPPRESS)
+    tf.add_argument("stamp")
+    lg = sub.add_parser("login", help="wallpaper on the login screen too (password once)")
+    lg.add_argument("action", choices=["setup", "remove", "status"])
+    ge = sub.add_parser("gender", help="characters: female only (female) or all (all) – looks up the characters again")
+    ge.add_argument("value", choices=["female", "all"])
+    so = sub.add_parser("source", help="image sources: source list | check [SOURCE] | set wallpaper|cutouts SOURCE")
+    so.add_argument("action", choices=["list", "check", "set"])
+    so.add_argument("purpose", nargs="?", default="")
+    so.add_argument("name", nargs="?", default="")
+    sub.add_parser("uninstall", help="graphical uninstaller (restores your KDE settings)")
+    up = sub.add_parser("update", help="updates from GitHub: update status|check|install|auto|remind|off")
+    up.add_argument("action", choices=["status", "check", "install", "auto", "remind", "off",
+                                       "on", "auto-on", "auto-off", "sync", "remove-timer"])
+    up.add_argument("--notify", action="store_true", help="desktop notification if a new version exists")
+    wl = sub.add_parser("wall", help="rotating wallpapers (source configurable, default Konachan)")
+    wl.add_argument("action", choices=["next", "fav", "ban", "fetch", "on", "off", "set", "list", "status", "open-favorites"])
+    wl.add_argument("arg", nargs="?", default="", help="fetch: count, set: image file")
+    wl.add_argument("--quiet", action="store_true")
+    wl.add_argument("--safe", action="store_true", help=argparse.SUPPRESS)
+    args = ap.parse_args(argv)
+
+    cfg = load_config()
+    i18n_setup(cfg)
+    if args.cmd == "init":
+        if not os.path.exists(CONFIG_FILE):
+            save_config(cfg)
+            say(_('Config angelegt: {path}', path=CONFIG_FILE))
+    elif args.cmd == "get":
+        val = get_path(cfg, args.path) if args.path else cfg
+        print(json.dumps(val, indent=2, ensure_ascii=False) if isinstance(val, (dict, list)) else ("" if val is None else val))
+    elif args.cmd == "set":
+        value = parse_value(args.value)
+        if args.path.startswith("colors."):
+            value = rgb2hex(hex2rgb(value))
+        set_path(cfg, args.path, value)
+        save_config(cfg)
+        # new interval → rewrite the timer
+        if args.path == "wallswitch.minutes" and wall_cfg(cfg)["enabled"]:
+            wall_timer(cfg, True)
+        if args.apply is not None:
+            cmd_apply(cfg, args.apply)
+    elif args.cmd == "search":
+        print(json.dumps(anime_search(" ".join(args.text)), ensure_ascii=False))
+    elif args.cmd == "anime":
+        cfg = anime_set(cfg, args.id)
+        if args.apply:
+            if wall_cfg(cfg)["enabled"] or not wall_state()["current"]:
+                wall_next(cfg, quiet=True)
+            else:
+                auto_colors(cfg, image_or_default(cfg, "wallpaper"))
+            cfg = load_config()
+            cmd_apply(cfg, ["colors", "konsole", "lock", "splash"])
+            say("✓ " + _("{title} ist aktiv", title=cfg['anime']['title']))
+    elif args.cmd == "adult":
+        for c in anime_chars(cfg):
+            if c["id"] == args.char_id:
+                if not char_lockable(c):
+                    sys.exit(_("{name}: laut AniList {age} – lässt sich nicht freischalten", name=c['name'], age=c['age']))
+                c["markedAdult"] = args.state == "on"
+                save_config(cfg)
+                say(f"{c['name']}: " + (_("volljährig") if c['markedAdult'] else _("nicht freigeschaltet")))
+                break
+        else:
+            sys.exit(_('Figur nicht gefunden'))
+    elif args.cmd == "cuts":
+        say(_('{count} neue Freisteller', count=fetch_cuts(cfg, args.count)))
+    elif args.cmd == "colors-from-wallpaper":
+        cfg.setdefault("theme", {})["autoColors"] = True
+        auto_colors(cfg, image_or_default(cfg, "wallpaper"))
+        say(_('Farben aus dem Hintergrund übernommen'))
+    elif args.cmd == "apply":
+        cmd_apply(cfg, args.parts)
+    elif args.cmd == "use-image":
+        src = os.path.abspath(os.path.expanduser(args.file.replace("file://", "")))
+        if not os.path.isfile(src):
+            sys.exit(_('Bild nicht gefunden: {src}', src=src))
+        cfg["images"][args.slot] = src
+        save_config(cfg)
+        if args.slot == "splash":
+            apply_splash(cfg)
+    elif args.cmd in ("add-folder", "remove-folder"):
+        folder = os.path.abspath(os.path.expanduser(args.folder.replace("file://", "")))
+        folders = [f for f in cfg.get("folders") or [] if f != folder]
+        if args.cmd == "add-folder":
+            if not os.path.isdir(folder):
+                sys.exit(_('Ordner nicht gefunden: {folder}', folder=folder))
+            folders.append(folder)
+        cfg["folders"] = folders
+        save_config(cfg)
+        n = len(folder_images(cfg))
+        say(_('{folders} eigene Ordner, {n} Bilder', folders=len(folders), n=n))
+    elif args.cmd == "images":
+        items = list_images(cfg) + folder_images(cfg)
+        if args.json:
+            print(json.dumps(items, ensure_ascii=False))
+        else:
+            for it in items:
+                print(f"{it['source']:11} {it['artist'][:24]:24} {it['path']}")
+    elif args.cmd == "fonts":
+        install_fonts()
+    elif args.cmd == "backup":
+        backup()
+    elif args.cmd == "restore":
+        restore(args.name)
+    elif args.cmd == "backups":
+        print("\n".join(list_backups()))
+    elif args.cmd == "layout":
+        sys.exit(0 if apply_layout(cfg) else 1)
+    elif args.cmd == "layout-script":
+        print(layout_script(cfg))
+    elif args.cmd == "status":
+        status(cfg)
+    elif args.cmd == "unrule":
+        remove_window_rule()
+    elif args.cmd == "selftest":
+        fails = safety_selftest()
+        for f in fails:
+            print("✗ " + f)
+        if fails:
+            sys.exit(1)
+        print("✓ " + _("Schutzregeln in Ordnung"))
+    elif args.cmd == "apps":
+        apps_toggle(cfg, args.app, args.state == "on")
+    elif args.cmd == "migrate":
+        if not migrate_vocastage():
+            say(_('Keine VocaStage-Installation gefunden'))
+    elif args.cmd == "terminal":
+        if args.state in ("kitty", "konsole"):
+            if args.state == "kitty" and not os.path.exists(os.path.join(KITTY_DIR, "bin", "kitty")):
+                install_kitty()
+            write_kitty_conf(cfg)
+            set_default_terminal(args.state)
+            cfg.setdefault("terminal", {})["app"] = args.state
+            save_config(cfg)
+            return
+        cfg.setdefault("terminal", {})["enabled"] = args.state == "on"
+        save_config(cfg)
+        if args.state == "on":
+            apply_konsole(cfg)
+            terminal_on(cfg, args.tools)
+        else:
+            terminal_off()
+    elif args.cmd == "greet":
+        greet(cfg)
+    elif args.cmd == "gender":
+        cfg.setdefault("characters", {})["gender"] = args.value
+        save_config(cfg)
+        a = cfg.get("anime") or {}
+        if a.get("id"):
+            say(_("Suche Figuren von {title} neu …", title=a.get('title')))
+            cfg = anime_set(cfg, a["id"], quiet=True)
+        n = len(anime_chars(cfg))
+        say("✓ " + (_("Nur weibliche Figuren – {n} gefunden", n=n) if args.value == "female" else _("Alle Figuren – {n} gefunden", n=n)))
+    elif args.cmd == "source":
+        source_cmd(cfg, args.action, args.purpose, args.name)
+    elif args.cmd == "uninstall":
+        uninstall_gui()
+    elif args.cmd == "update":
+        update_cmd(cfg, args.action, args.notify)
+    elif args.cmd == "themed":
+        if args.action == "status":
+            print(json.dumps(themed_status(cfg), ensure_ascii=False))
+        else:
+            try:
+                if args.tags is not None:
+                    key = ("terminal", "bgTags") if args.target == "terminal" else ("firefox", "tags")
+                    cfg.setdefault(key[0], {})[key[1]] = args.tags
+                    if not search_tags(args.tags):
+                        raise ValueError(_('Keine Suchbegriffe eingetragen'))
+                    save_config(cfg)
+                themed_new(cfg, args.target)
+            except Exception as exc:
+                sys.exit(str(exc))
+    elif args.cmd == "themed-rotate":
+        themed_rotate(cfg, args.target)
+    elif args.cmd == "themed-prefetch":
+        lock = themed_lock(args.target)
+        if lock:
+            try:
+                themed_fetch(cfg, args.target)
+            except Exception as exc:
+                log(f"{args.target}-vorladen: {exc}")
+    elif args.cmd == "term-fetch":
+        path = term_fetch_now(cfg)
+        if path:
+            write_atomic(args.stamp, path)
+    elif args.cmd == "login":
+        if args.action == "status":
+            print((_("veraltet – bitte neu einrichten") if login_outdated() else _("aktiv")) if login_ready() else _("nicht eingerichtet"))
+        else:
+            login_setup(args.action == "remove")
+    elif args.cmd == "wall":
+        if args.action == "next":
+            sys.exit(0 if wall_next(cfg, args.quiet) else 1)
+        elif args.action == "fav":
+            wall_fav(cfg)
+        elif args.action == "ban":
+            wall_ban(cfg)
+        elif args.action == "fetch":
+            n = wall_fetch(term_wall_cfg(cfg) if args.safe else cfg, int(args.arg or 6), quiet=args.quiet)
+            if not args.quiet:
+                say(_('{n} neue Bilder geladen', n=n))
+        elif args.action == "set":
+            if not args.arg:
+                sys.exit(_('animestage wall set BILDDATEI'))
+            wall_set(cfg, args.arg)
+        elif args.action == "list":
+            print(json.dumps(wall_list(cfg), ensure_ascii=False))
+        elif args.action in ("on", "off"):
+            cfg["wallswitch"] = wall_cfg(cfg)
+            cfg["wallswitch"]["enabled"] = args.action == "on"
+            save_config(cfg)
+            wall_timer(cfg, args.action == "on")
+            if args.action == "on":
+                wall_next(cfg)
+        elif args.action == "status":
+            print(json.dumps(wall_status(cfg), ensure_ascii=False))
+        elif args.action == "open-favorites":
+            os.makedirs(favorites_dir(), exist_ok=True)
+            subprocess.Popen(["xdg-open", favorites_dir()], start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+if __name__ == "__main__":
+    main()

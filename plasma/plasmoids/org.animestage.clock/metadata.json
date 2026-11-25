@@ -1,0 +1,22 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "propanisen"
+            }
+        ],
+        "Category": "Date and Time",
+        "Description": "Time and date, click shows the calendar",
+        "EnabledByDefault": true,
+        "Icon": "preferences-system-time",
+        "Id": "org.animestage.clock",
+        "License": "GPL-3.0",
+        "Name": "AnimeStage Clock",
+        "Version": "2.0.0",
+        "Website": "https://github.com/propanisen/AnimeStage",
+        "Name[de]": "AnimeStage Uhr",
+        "Description[de]": "Uhrzeit und Datum, Klick zeigt den Kalender"
+    },
+    "X-Plasma-API-Minimum-Version": "6.0"
+}
