@@ -97,7 +97,7 @@ ART
 confirm() {
     [[ $YES -eq 1 ]] && return 0
     read -r -p "$1 $(t "[j/N]") " answer
-    [[ "$answer" =~ ^[jJyYoOsSдДтТ是はい예]$ ]] || [[ "$answer" =~ ^(si|sí|tak|ja|yes|oui|sim|да|是|はい|예)$ ]]
+    [[ "$answer" =~ ^[jJyYoOsStTдДтТ是はい예]$ ]] || [[ "$answer" =~ ^(si|sí|tak|ja|yes|oui|sim|да|是|はい|예)$ ]]
 }
 
 check_tools() {

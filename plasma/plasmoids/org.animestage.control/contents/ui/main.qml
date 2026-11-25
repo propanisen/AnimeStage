@@ -185,7 +185,7 @@ PlasmoidItem {
             property var applyParts: ["style"]
             property bool percent: true
             Layout.fillWidth: true
-            Stage.StageText { stage: vc; text: slide.label; Layout.preferredWidth: win.u * 10; font.pixelSize: win.u * 0.8 }
+            Stage.StageText { stage: vc; text: slide.label; Layout.preferredWidth: win.u * 13; font.pixelSize: win.u * 0.8; elide: Text.ElideRight }
             QQC2.Slider {
                 id: sl
                 Layout.fillWidth: true
@@ -1169,12 +1169,14 @@ PlasmoidItem {
                                 Stage.StageText { stage: vc; text: vc.tr("Fensterrahmen"); font.pixelSize: win.u * 0.8 }
                                 QQC2.ComboBox {
                                     textRole: "text"; valueRole: "value"
+                                    Layout.preferredWidth: win.u * 18
                                     model: [{ text: vc.tr("Breeze in Theme-Farben (mit Schatten)"), value: "breeze" }, { text: vc.tr("AnimeStage flach (Farbpunkte)"), value: "aurorae" }]
                                     currentIndex: indexOfValue(vc.opt("style.windowDeco", "breeze"))
                                     onActivated: vc.set("style.windowDeco", currentValue, ["deco"])
                                 }
                                 Stage.StageText { stage: vc; text: vc.tr("Programm-Stil"); font.pixelSize: win.u * 0.8 }
                                 QQC2.ComboBox {
+                                    Layout.preferredWidth: win.u * 18
                                     textRole: "text"; valueRole: "value"
                                     model: [{ text: vc.tr("Breeze (empfohlen)"), value: "breeze" }, { text: vc.tr("Kvantum (muss installiert sein)"), value: "kvantum" }]
                                     currentIndex: indexOfValue(vc.opt("style.appStyle", "breeze"))
@@ -1184,6 +1186,7 @@ PlasmoidItem {
                             RowLayout {
                                 Stage.StageText { stage: vc; text: vc.tr("Icons"); font.pixelSize: win.u * 0.8; Layout.preferredWidth: win.u * 7 }
                                 QQC2.ComboBox {
+                                    Layout.preferredWidth: win.u * 18
                                     textRole: "text"; valueRole: "value"
                                     model: [{ text: vc.tr("Papirus-Dark, Ordner in Akzentfarbe"), value: "papirus" }, { text: vc.tr("Nicht ändern"), value: "keep" }]
                                     currentIndex: indexOfValue(vc.opt("style.icons", "papirus"))
@@ -1210,6 +1213,7 @@ PlasmoidItem {
                                 visible: vc.opt("taskbar.labels", true)
                                 Stage.StageText { stage: vc; text: vc.tr("Breite der Einträge"); font.pixelSize: win.u * 0.8; Layout.preferredWidth: win.u * 8 }
                                 QQC2.ComboBox {
+                                    Layout.preferredWidth: win.u * 18
                                     textRole: "text"; valueRole: "value"
                                     model: [{ text: vc.tr("Schmal"), value: "narrow" }, { text: vc.tr("Mittel (KDE-Standard)"), value: "medium" }, { text: vc.tr("Breit"), value: "wide" }]
                                     currentIndex: indexOfValue(vc.opt("taskbar.width", "narrow"))
@@ -1223,6 +1227,7 @@ PlasmoidItem {
                             RowLayout {
                                 Stage.StageText { stage: vc; text: vc.tr("Panel-Symbol"); font.pixelSize: win.u * 0.8 }
                                 QQC2.ComboBox {
+                                    Layout.preferredWidth: win.u * 18
                                     textRole: "text"; valueRole: "value"
                                     model: [{ text: vc.tr("Logo der Distribution"), value: "distro" }, { text: vc.tr("AnimeStage-Stern"), value: "logo" }, { text: vc.tr("Anime-Cover"), value: "cover" }, { text: vc.tr("Launcher-Bild (Freisteller)"), value: "character" }]
                                     currentIndex: indexOfValue(vc.opt("launcher.icon", "distro"))
@@ -1400,6 +1405,7 @@ PlasmoidItem {
                                 visible: vc.opt("terminal.bgImage", true)
                                 Stage.StageText { stage: vc; text: vc.tr("Bild sichtbar"); font.pixelSize: win.u * 0.8; Layout.preferredWidth: win.u * 8 }
                                 QQC2.ComboBox {
+                                    Layout.preferredWidth: win.u * 18
                                     textRole: "text"; valueRole: "value"
                                     model: [{ text: vc.tr("Ganz dezent"), value: 0.92 }, { text: vc.tr("Dezent (empfohlen)"), value: 0.86 }, { text: vc.tr("Deutlich"), value: 0.76 }, { text: vc.tr("Kräftig"), value: 0.65 }]
                                     currentIndex: indexOfValue(vc.opt("terminal.bgDim", 0.86))
@@ -1428,7 +1434,7 @@ PlasmoidItem {
                                             dialogTitle: modelData.label
                                             onAccepted: function (c) { vc.set("terminal." + modelData.key, c.toString().substring(0, 7), ["konsole"]); }
                                         }
-                                        Stage.StageText { stage: vc; text: parent.own.length ? "eigene" : vc.tr("wie Figur"); color: vc.muted; font.pixelSize: win.u * 0.7 }
+                                        Stage.StageText { stage: vc; text: parent.own.length ? vc.tr("eigene") : vc.tr("wie Figur"); color: vc.muted; font.pixelSize: win.u * 0.7 }
                                     }
                                 }
                             }
@@ -1439,6 +1445,7 @@ PlasmoidItem {
                                 QQC2.SpinBox { from: 8; to: 20; value: vc.opt("terminal.fontSize", 11); onValueModified: vc.set("terminal.fontSize", value, ["konsole"]) }
                                 Stage.StageText { stage: vc; text: vc.tr("Deckkraft"); font.pixelSize: win.u * 0.8 }
                                 QQC2.ComboBox {
+                                    Layout.preferredWidth: win.u * 18
                                     textRole: "text"; valueRole: "value"
                                     model: [{ text: vc.tr("Undurchsichtig"), value: 1 }, { text: vc.tr("Leicht durchscheinend (97 %)"), value: 0.97 }, { text: vc.tr("Glas (88 %)"), value: 0.88 }, { text: vc.tr("Viel Glas (75 %)"), value: 0.75 }]
                                     currentIndex: indexOfValue(vc.opt("terminal.opacity", 0.97))
@@ -1489,6 +1496,7 @@ PlasmoidItem {
                                 visible: parent.on && vc.opt("firefox.source", "anime") !== "none"
                                 Stage.StageText { stage: vc; text: vc.tr("Bild sichtbar"); font.pixelSize: win.u * 0.8; Layout.preferredWidth: win.u * 8 }
                                 QQC2.ComboBox {
+                                    Layout.preferredWidth: win.u * 18
                                     textRole: "text"; valueRole: "value"
                                     model: [{ text: vc.tr("Kräftig"), value: 0.15 }, { text: vc.tr("Deutlich (empfohlen)"), value: 0.35 }, { text: vc.tr("Dezent"), value: 0.55 }, { text: vc.tr("Ganz dezent"), value: 0.75 }]
                                     currentIndex: indexOfValue(vc.opt("firefox.dim", 0.35))

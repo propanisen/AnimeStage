@@ -12,7 +12,7 @@ Type in an anime – AnimeStage builds the whole desktop around it: rotating wal
 - **Pick any anime** – search via AniList; title, banner and characters (with age) are loaded automatically.
 - **Wallpapers that rotate** – new images from Konachan every 2 hours (adjustable), per character, filter and mood. Save favorites or ban images.
 - **Colors follow the wallpaper** – accent colors are taken from every new image and applied to Plasma, window decorations, icons (Papirus folders), terminal, Firefox and VS Code.
-- **Anime-style panel** – start menu with a character cutout, task manager with window titles, music pill, CPU/RAM/GPU rings and a calendar.
+- **Anime-style panel** – start menu with a character cutout, a Windows-like taskbar with window titles, music player, CPU/RAM/GPU rings and a calendar.
 - **Terminal** – kitty or Konsole in theme colors, a greeting with a fresh image + system info, Starship prompt, and an optional image as terminal background.
 - **Firefox** – tabs and address bar in matching colors plus a new-tab image that changes on every start.
 - **Lock screen & login screen** show your wallpaper too (login: Plasma Login Manager).
@@ -23,7 +23,7 @@ Type in an anime – AnimeStage builds the whole desktop around it: rotating wal
 
 ![Taskbar with window titles](docs/screenshots/taskbar.png)
 
-Every window gets its own entry with its title next to the icon – two Firefox windows are two entries. Pinned apps stay where you put them, and their windows open right there. In **Control Center → Appearance → Task manager** you can turn titles off, group windows or choose the width (narrow / medium / wide).
+Every window gets its own entry with its title next to the icon – two Firefox windows are two entries. Pinned apps stay where you put them, and their windows open right there. In **Control Center → Appearance → Taskbar** you can turn titles off, group windows or choose the width (narrow / medium / wide).
 
 ### Wallpapers & colors
 
@@ -124,7 +124,7 @@ animestage search frieren            # AniList search
 animestage anime 154587 --apply      # use an anime
 animestage wall next | fav | ban     # next wallpaper, save as favorite, never show again
 animestage set wallswitch.minutes 60 # rotation interval
-animestage themed new terminal --tags "night, city"   # own terminal background search
+animestage themed new terminal --tags "night, city"   # custom search for the terminal background
 animestage source check              # are the image sites reachable?
 animestage status
 animestage --help

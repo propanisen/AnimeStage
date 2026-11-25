@@ -232,9 +232,9 @@ PlasmoidItem {
                 RowLayout {
                     Layout.alignment: Qt.AlignHCenter
                     spacing: card.u * 0.6
-                    Stage.StageButton { stage: vc; icon: "media-skip-backward"; tooltip: vc.tr("Zurück"); enabled: root.hasPlayer && root.player.canGoPrevious; onClicked: root.player.Previous() }
+                    Stage.StageButton { stage: vc; icon: "media-skip-backward"; tooltip: vc.tr("Vorheriger Titel"); enabled: root.hasPlayer && root.player.canGoPrevious; onClicked: root.player.Previous() }
                     Stage.StageButton { stage: vc; icon: root.playing ? "media-playback-pause" : "media-playback-start"; tooltip: vc.tr("Play/Pause"); enabled: root.hasPlayer; onClicked: root.player.PlayPause() }
-                    Stage.StageButton { stage: vc; icon: "media-skip-forward"; tooltip: vc.tr("Weiter"); enabled: root.hasPlayer && root.player.canGoNext; onClicked: root.player.Next() }
+                    Stage.StageButton { stage: vc; icon: "media-skip-forward"; tooltip: vc.tr("Nächster Titel"); enabled: root.hasPlayer && root.player.canGoNext; onClicked: root.player.Next() }
                 }
             }
         }
