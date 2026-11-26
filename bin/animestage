@@ -43,6 +43,8 @@ CREDITS_FILE = os.path.join(IMAGE_DIR, "credits.json")
 STATE_DIR = os.path.join(XDG_STATE, "animestage")
 BACKUP_DIR = os.path.join(STATE_DIR, "backups")
 LOG_FILE = os.path.join(STATE_DIR, "animestage.log")
+# progress of long tasks (anime setup …) – the Control Center shows it as a loading overlay
+PROGRESS_FILE = os.path.join(STATE_DIR, "progress.json")
 
 THEME_NAME = "AnimeStage"
 LNF_ID = "org.animestage.desktop"
@@ -82,6 +84,34 @@ def log(msg):
     os.makedirs(STATE_DIR, exist_ok=True)
     with open(LOG_FILE, "a", encoding="utf-8") as fh:
         fh.write(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S} {msg}\n")
+
+
+def progress(step, total, text):
+    """Report a step of a long task to the Control Center (removed again on exit)."""
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = PROGRESS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"pid": os.getpid(), "step": step, "total": total, "text": text}, fh, ensure_ascii=False)
+        os.replace(tmp, PROGRESS_FILE)
+        if not _progress_cleanup:
+            import atexit
+            atexit.register(progress_done)
+            _progress_cleanup.append(True)
+    except OSError:
+        pass
+
+
+_progress_cleanup = []
+
+
+def progress_done():
+    try:
+        with open(PROGRESS_FILE, encoding="utf-8") as fh:
+            if json.load(fh).get("pid") == os.getpid():
+                os.remove(PROGRESS_FILE)
+    except (OSError, ValueError):
+        pass
 
 
 def say(msg):
@@ -1245,6 +1275,7 @@ def anime_set(cfg, anime_id, quiet=False):
     q = """query($id:Int){Media(id:$id,type:ANIME){id title{romaji english native} seasonYear format
         coverImage{extraLarge color} bannerImage
         characters(sort:[ROLE,FAVOURITES_DESC],perPage:25){edges{role node{id name{full native alternative} age gender image{large}}}}}}"""
+    progress(1, 7, _("Lade Anime-Daten von AniList"))
     m = anilist(q, {"id": int(anime_id)})["Media"]
     title = m["title"]["english"] or m["title"]["romaji"]
     say(_('Anime: {title}', title=title))
@@ -1259,9 +1290,11 @@ def anime_set(cfg, anime_id, quiet=False):
                 log(f"download {url}: {exc}")
         return dest if os.path.exists(dest) else ""
 
+    progress(2, 7, _("Lade Cover und Banner"))
     cover = grab(m["coverImage"]["extraLarge"], os.path.join(folder, "cover.jpg"))
     banner = grab(m["bannerImage"], os.path.join(folder, "banner.jpg"))
     ws, cs = wall_src(cfg), cut_src(cfg)
+    progress(3, 7, _("Suche {title} bei {site} …", title=title, site=ws.label))
     wall_tag = find_copyright(ws, m)
     cut_tag = wall_tag if cs.name == ws.name else find_copyright(cs, m)
     say("  " + _("{site}-Tag: {tag}", site=ws.name, tag=wall_tag or _("– nicht gefunden –"))
@@ -1272,6 +1305,7 @@ def anime_set(cfg, anime_id, quiet=False):
     chars, excluded = [], []
     for e in m["characters"]["edges"]:
         n = e["node"]
+        progress(4, 7, _("Suche Figuren: {name}", name=n["name"]["full"]))
         if only_female and (n["gender"] or "").lower() != "female":
             # male characters: still remember the tag so images with them get filtered out
             if len(excluded) < 6 and wall_tag:
@@ -1304,6 +1338,7 @@ def anime_set(cfg, anime_id, quiet=False):
         cfg["images"][slot] = ""
     save_config(cfg)
     if cut_tag:
+        progress(5, 7, _("Lade Freisteller von {site}", site=cs.label))
         fetch_cuts(cfg, 6, quiet=quiet)
     return cfg
 
@@ -4109,11 +4144,13 @@ def main(argv=None):
     elif args.cmd == "anime":
         cfg = anime_set(cfg, args.id)
         if args.apply:
+            progress(6, 7, _("Lade das erste Hintergrundbild"))
             if wall_cfg(cfg)["enabled"] or not wall_state()["current"]:
                 wall_next(cfg, quiet=True)
             else:
                 auto_colors(cfg, image_or_default(cfg, "wallpaper"))
             cfg = load_config()
+            progress(7, 7, _("Wende Farben und Theme an"))
             cmd_apply(cfg, ["colors", "konsole", "lock", "splash"])
             say("✓ " + _("{title} ist aktiv", title=cfg['anime']['title']))
     elif args.cmd == "adult":

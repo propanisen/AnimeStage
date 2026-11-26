@@ -13,6 +13,12 @@ PlasmoidItem {
 
     property string status: vc.tr("Bereit.")
     property bool busy: false
+    // loading overlay for long tasks (choosing an anime takes up to a minute)
+    property bool overlay: false
+    property string overlayTitle: ""
+    property string overlayCover: ""
+    property var prog: ({})
+    readonly property string stateDir: vc.dataHome.replace(/\/share\/?$/, "/state") + "/animestage"
     property var images: []
     property var backups: []
     property var wall: ({})
@@ -41,7 +47,20 @@ PlasmoidItem {
     function cli(args, label) {
         busy = true;
         status = label + " …";
+        overlay = isLong(args);
+        if (overlay) {
+            prog = ({});
+            if (overlayTitle === "" || args[0] !== "anime") overlayTitle = label;
+        }
         vc.run(args, "cc-" + args[0]);
+    }
+
+    // tasks that download from the internet and take a while
+    function isLong(args) {
+        const a = args[0], b = args[1] || "";
+        return a === "anime" || a === "gender" || a === "cuts" || a === "fetch-defaults"
+            || (a === "source" && b === "set") || (a === "update" && b === "install")
+            || (a === "wall" && (b === "next" || b === "ban" || b === "on"));
     }
 
     function refreshImages() { vc.run(["images", "--json"], "cc-list"); }
@@ -72,6 +91,10 @@ PlasmoidItem {
                 try { root.sourceInfo = JSON.parse(stdout); } catch (e) {}
                 return;
             }
+            if (tag === "progress") {
+                try { root.prog = JSON.parse(stdout); } catch (e) {}
+                return;
+            }
             if (tag === "updstatus") {
                 try { root.updateInfo = JSON.parse(stdout); } catch (e) {}
                 return;
@@ -90,6 +113,9 @@ PlasmoidItem {
             }
             if (tag.indexOf("cc-") !== 0) return;
             root.busy = false;
+            root.overlay = false;
+            root.overlayTitle = "";
+            root.overlayCover = "";
             const lines = (code === 0 ? stdout : (stderr || stdout)).trim().split("\n");
             root.status = (code === 0 ? "✓ " : "✗ ") + (lines[lines.length - 1] || "fertig");
             if (["cc-cuts", "cc-use-image", "cc-anime", "cc-add-folder", "cc-remove-folder"].indexOf(tag) >= 0) root.refreshImages();
@@ -513,6 +539,8 @@ PlasmoidItem {
                                             cursorShape: Qt.PointingHandCursor
                                             enabled: !root.busy
                                             onClicked: {
+                                                root.overlayTitle = modelData.title;
+                                                root.overlayCover = modelData.cover || "";
                                                 root.cli(["anime", String(modelData.id), "--apply"], vc.tr("%1 wird eingerichtet (Figuren, Bilder, Farben)", [modelData.title]));
                                                 root.results = [];
                                             }
@@ -1686,5 +1714,100 @@ PlasmoidItem {
                 }
             }
         }
+
+        // ------------------------------------------------ loading overlay
+        Timer {
+            interval: 700
+            repeat: true
+            running: root.overlay
+            triggeredOnStart: true
+            onTriggered: vc.shell("cat " + vc.quote(root.stateDir + "/progress.json") + " 2>/dev/null", "progress")
+        }
+
+        Rectangle {
+            anchors.fill: parent
+            visible: root.overlay
+            z: 100
+            color: vc.alpha(vc.bg, 0.86)
+            // swallow all input while the task runs
+            MouseArea { anchors.fill: parent; hoverEnabled: true; acceptedButtons: Qt.AllButtons; onWheel: function (w) { w.accepted = true } }
+
+            Rectangle {
+                anchors.centerIn: parent
+                width: Math.min(parent.width - win.u * 4, win.u * 28)
+                height: box.implicitHeight + win.u * 2.4
+                radius: vc.radius
+                color: vc.surface
+                border.color: vc.alpha(vc.accent, 0.45)
+                border.width: 1
+
+                ColumnLayout {
+                    id: box
+                    anchors.fill: parent
+                    anchors.margins: win.u * 1.2
+                    spacing: win.u * 0.7
+
+                    RowLayout {
+                        spacing: win.u * 0.9
+                        Image {
+                            visible: root.overlayCover !== ""
+                            source: root.overlayCover
+                            fillMode: Image.PreserveAspectCrop
+                            Layout.preferredWidth: win.u * 3.6
+                            Layout.preferredHeight: win.u * 5
+                        }
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: win.u * 0.2
+                            Stage.StageText {
+                                stage: vc
+                                text: root.overlayTitle
+                                font.pixelSize: win.u * 1.05
+                                font.weight: Font.Bold
+                                wrapMode: Text.Wrap
+                                Layout.fillWidth: true
+                            }
+                            Stage.StageText {
+                                stage: vc
+                                text: root.overlayCover !== "" ? vc.tr("wird eingerichtet …") : vc.tr("Bitte warten …")
+                                color: vc.accent
+                                font.pixelSize: win.u * 0.8
+                            }
+                        }
+                        QQC2.BusyIndicator {
+                            running: root.overlay
+                            Layout.preferredWidth: win.u * 2.2
+                            Layout.preferredHeight: win.u * 2.2
+                        }
+                    }
+
+                    QQC2.ProgressBar {
+                        Layout.fillWidth: true
+                        from: 0
+                        to: root.prog.total || 1
+                        value: root.prog.step || 0
+                        indeterminate: !root.prog.total
+                    }
+
+                    Stage.StageText {
+                        stage: vc
+                        text: root.prog.total ? vc.tr("Schritt %1 von %2: %3", [root.prog.step, root.prog.total, root.prog.text]) : root.status
+                        font.pixelSize: win.u * 0.8
+                        wrapMode: Text.Wrap
+                        Layout.fillWidth: true
+                    }
+
+                    Stage.StageText {
+                        stage: vc
+                        text: vc.tr("Bilder und Infos werden aus dem Internet geladen – das kann eine Minute dauern. Bitte das Fenster offen lassen.")
+                        color: vc.muted
+                        font.pixelSize: win.u * 0.7
+                        wrapMode: Text.Wrap
+                        Layout.fillWidth: true
+                    }
+                }
+            }
+        }
+
     }
 }
