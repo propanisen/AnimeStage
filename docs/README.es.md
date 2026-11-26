@@ -9,15 +9,15 @@ Escribe el nombre de un anime y AnimeStage viste todo el escritorio a su alreded
 
 ## Funciones
 
-- **Cualquier anime** – búsqueda en AniList; el título, el banner y los personajes (con su edad) se cargan solos.
-- **Fondos que cambian** – imágenes nuevas de Konachan cada 2 horas (ajustable), según personaje, filtro y ambiente. Guarda tus favoritas y descarta las que no te gusten.
-- **Los colores siguen al fondo** – de cada imagen nueva se sacan los colores de acento para Plasma, la decoración de ventanas, los iconos de carpeta (Papirus), el terminal, Firefox y VS Code.
-- **Panel con estilo anime** – menú de inicio con personaje, barra de tareas con el título de las ventanas como en Windows, reproductor de música, anillos de CPU/RAM/GPU y calendario.
-- **Terminal** – kitty o Konsole con los colores del tema, un saludo con imagen nueva e información del sistema, prompt de Starship y, si quieres, una imagen de fondo.
-- **Firefox** – pestañas y barra de direcciones a juego, y una imagen nueva en la página de nueva pestaña cada vez que lo abres.
+- **Cualquier anime:** búsqueda en AniList; el título, el banner y los personajes (con su edad) se cargan solos.
+- **Fondos que cambian:** imágenes nuevas de Konachan cada 2 horas (ajustable), según personaje, filtro y ambiente. Guarda tus favoritas y descarta las que no te gusten.
+- **Los colores siguen al fondo:** de cada imagen nueva se sacan los colores de acento para Plasma, la decoración de ventanas, los iconos de carpeta (Papirus), el terminal, Firefox y VS Code.
+- **Panel con estilo anime:** menú de inicio con personaje, barra de tareas con el título de las ventanas como en Windows, reproductor de música, anillos de CPU/RAM/GPU y calendario.
+- **Terminal:** kitty o Konsole con los colores del tema, un saludo con imagen nueva e información del sistema, prompt de Starship y, si quieres, una imagen de fondo.
+- **Firefox:** pestañas y barra de direcciones a juego, y una imagen nueva en la página de nueva pestaña cada vez que lo abres.
 - **La pantalla de bloqueo y la de inicio de sesión** también muestran tu fondo (inicio de sesión: Plasma Login Manager).
-- **Centro de control** – todo se ajusta en una sola ventana, sin tocar archivos de configuración.
-- **13 idiomas** – sigue el idioma del sistema y se puede cambiar en el Centro de control.
+- **Centro de control:** todo se ajusta en una sola ventana, sin tocar archivos de configuración.
+- **13 idiomas:** sigue el idioma del sistema y se puede cambiar en el Centro de control.
 
 ### Barra de tareas como en Windows
 
